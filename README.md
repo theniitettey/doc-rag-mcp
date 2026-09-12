@@ -57,6 +57,33 @@ flowchart TD
     J --> A
 ```
 
+**Staying fresh** — the agent doesn't need the user to say "I changed the
+docs." `list_documents()` reports when the collection was last reindexed
+and, via a cheap `stat()`-only check (file mtime + size, no file content
+read — so this stays fast no matter how large the docs get), whether
+anything on disk looks new/changed/removed since. Seeing that signal is
+enough for the agent to call `reindex_docs()` on its own:
+
+```mermaid
+flowchart TD
+    A[MCP client] -- list_documents --> B[MCP server]
+    B --> C[stat() every file:<br/>mtime + size only]
+    C --> D{new/changed/removed<br/>vs last index?}
+    D -- no --> E["'index matches docs'"]
+    D -- yes --> F["'! N new, M changed,<br/>K removed -- reindex_docs()'"]
+    E --> A
+    F --> A
+    A -- sees staleness signal,<br/>calls reindex_docs on its own --> G[MCP server]
+    G --> H[content-hash diff<br/>+ embed changed files]
+    H --> I[(Postgres + pgvector)]
+```
+
+The `stat()` check is a fast heuristic, not the authoritative one — a
+touched-but-unedited file can show up as "changed" here. That's fine:
+the content-hash diffing in the ingestion flow above is what actually
+decides what gets re-embedded, and it correctly skips anything whose
+content didn't really change.
+
 Both flows share one Postgres table (`doc_chunks`), namespaced by a
 `collection` column so multiple doc sets can coexist in the same database.
 
@@ -179,7 +206,10 @@ Once connected, it exposes six tools:
   score. Ranks by rerank (`RAG_RERANK_MODEL`) if set, else hybrid search
   (`RAG_HYBRID_SEARCH=true`) if enabled, else plain cosine similarity — see
   "Improving on plain vector search" below.
-- `list_documents()` — lists every file currently indexed
+- `list_documents()` — lists every file currently indexed, when the
+  collection was last reindexed, and a fast staleness signal (new/changed/
+  removed files since then, detected via file mtime + size) — see
+  "Staying fresh" above
 - `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
   re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
   the chat to run `ingest.py` by hand. Incremental by default; blocks until
