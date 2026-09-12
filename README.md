@@ -18,29 +18,37 @@ your documents and queries never go anywhere except to the embedding API.
 ## How it works
 
 **Ingestion** — point it at a folder (or a single file), it chunks and
-embeds anything new or changed, and skips the rest:
+embeds anything new or changed (via whichever `RAG_EMBED_PROVIDER` is
+configured — Voyage, Azure OpenAI, or OpenAI), and skips the rest:
 
 ```mermaid
 flowchart TD
     A[docs folder] --> B[chunk text]
     B --> C{content hash<br/>changed?}
     C -- no --> D[skip, no API call]
-    C -- yes --> E[embed via Voyage AI]
+    C -- yes --> E[embed via configured provider]
     E --> F[(Postgres + pgvector)]
 ```
 
-**Querying** — the agent calls the MCP tool, which embeds the question and
-finds the closest chunks by cosine similarity:
+**Querying** — the agent calls the MCP tool, which embeds the question,
+runs a vector search, then improves on plain cosine-similarity ranking if
+reranking or hybrid search is configured (rerank wins if both are):
 
 ```mermaid
 flowchart TD
     A[MCP client] -- query_docs --> B[MCP server]
     B --> C{cached?}
-    C -- yes --> G[return cached answer]
-    C -- no --> D[embed query via Voyage AI]
-    D --> E[(Postgres + pgvector<br/>cosine search)]
-    E --> F[top-k matching chunks]
-    F --> A
+    C -- yes --> Z[return cached answer]
+    C -- no --> D[embed query via configured provider]
+    D --> E[(vector search<br/>Postgres + pgvector)]
+    E --> F{rerank or<br/>hybrid search set?}
+    F -- rerank --> G[re-score with<br/>Voyage rerank API]
+    F -- hybrid --> H[fuse with full-text search<br/>via reciprocal rank fusion]
+    F -- neither --> I[top-k by<br/>cosine similarity]
+    G --> J[top-k results]
+    H --> J
+    I --> J
+    J --> A
 ```
 
 Both flows share one Postgres table (`doc_chunks`), namespaced by a
