@@ -62,6 +62,11 @@ import db
 import ingest
 
 MAX_TOP_K = 50
+# When reranking (db.RERANK_MODEL set), fetch this many candidates by vector
+# search per requested result, capped at RERANK_MAX_CANDIDATES -- gives the
+# reranker a real pool to choose from without an unbounded/expensive fetch.
+RERANK_CANDIDATE_MULTIPLIER = 4
+RERANK_MAX_CANDIDATES = 100
 
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "project_docs")
 
@@ -191,7 +196,14 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
 
     try:
         query_embedding = db.embed_texts(get_voyage(), [query], input_type="query", conn=get_conn())[0]
-        rows = run_query(lambda conn: conn.execute(
+
+        # When reranking, over-fetch a larger candidate pool by cheap vector
+        # search, then let the (more accurate, more expensive) reranker pick
+        # the real top_k from those -- rather than ask pgvector for exactly
+        # top_k up front, which would deny the reranker anything to work with.
+        fetch_k = min(top_k * RERANK_CANDIDATE_MULTIPLIER, RERANK_MAX_CANDIDATES) if db.RERANK_MODEL else top_k
+
+        candidates = run_query(lambda conn: conn.execute(
             """
             SELECT source, chunk_index, content, embedding <=> %s AS distance
             FROM doc_chunks
@@ -199,8 +211,19 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
             ORDER BY embedding <=> %s
             LIMIT %s
             """,
-            (query_embedding, COLLECTION_NAME, query_embedding, top_k),
+            (query_embedding, COLLECTION_NAME, query_embedding, fetch_k),
         ).fetchall())
+
+        # Normalize to (source, chunk_idx, content, score) with score always
+        # "higher is better", regardless of which path produced it.
+        if db.RERANK_MODEL and candidates:
+            documents = [c[2] for c in candidates]
+            ranked = db.rerank_texts(get_voyage(), query, documents, top_k, conn=get_conn())
+            rows = [(candidates[idx][0], candidates[idx][1], candidates[idx][2], score)
+                    for idx, score in ranked]
+        else:
+            rows = [(source, chunk_idx, content, 1 - distance)
+                    for source, chunk_idx, content, distance in candidates[:top_k]]
     except Exception as e:
         if ctx:
             await ctx.info(f"query failed: {e}")
@@ -213,9 +236,9 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
 
     total = len(rows)
     parts = []
-    for i, (source, chunk_idx, content, distance) in enumerate(rows, start=1):
+    for i, (source, chunk_idx, content, score) in enumerate(rows, start=1):
         parts.append(
-            f"[{i}] source: {source} (chunk {chunk_idx}, relevance score {1 - distance:.3f})\n{content}"
+            f"[{i}] source: {source} (chunk {chunk_idx}, relevance score {score:.3f})\n{content}"
         )
         if ctx:
             await ctx.report_progress(i, total)

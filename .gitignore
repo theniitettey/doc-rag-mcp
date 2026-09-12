@@ -6,7 +6,11 @@ __pycache__/
 # Secrets / machine-specific config -- copy from the committed .example files
 .env
 .mcp.json
-.claude/
+
+# Ship the project skill(s) with the repo
+.claude/*
+!.claude/skills/
+!.claude/skills/**
 
 # Local Docs
 docs/
