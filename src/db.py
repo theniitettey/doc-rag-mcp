@@ -35,6 +35,10 @@ VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY")
 # Empty (default) = reranking disabled. Opt-in via RAG_RERANK_MODEL since it
 # costs its own tokens on top of the embedding call, on every query.
 RERANK_MODEL = os.environ.get("RAG_RERANK_MODEL", "")
+# Free, provider-agnostic alternative/complement to reranking: fuse vector
+# search with Postgres full-text search (no API calls at all). Only takes
+# effect when RERANK_MODEL is unset -- rerank wins if both are configured.
+HYBRID_SEARCH = os.environ.get("RAG_HYBRID_SEARCH", "").lower() in ("1", "true", "yes")
 
 # Azure OpenAI (RAG_EMBED_PROVIDER=azure-openai)
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -74,6 +78,17 @@ def ensure_schema(conn):
     conn.execute("""
         CREATE INDEX IF NOT EXISTS doc_chunks_embedding_idx
         ON doc_chunks USING hnsw (embedding vector_cosine_ops)
+    """)
+    # Added via ALTER (not the CREATE TABLE above) so it backfills correctly
+    # on a database that already has rows from before hybrid search existed,
+    # the same way a fresh install gets it too.
+    conn.execute("""
+        ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+        GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS doc_chunks_content_tsv_idx
+        ON doc_chunks USING gin (content_tsv)
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS collection_config (
