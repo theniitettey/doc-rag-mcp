@@ -158,10 +158,10 @@ in section 5 for the HTTP case:
 Once connected, it exposes six tools:
 
 - `query_docs(query, top_k=5)` — semantic search over the indexed chunks,
-  returns the matching passages with their source file and a relevance score.
-  If `RAG_RERANK_MODEL` is set, over-fetches candidates by vector search and
-  re-scores them with Voyage's rerank API for more accurate results (see
-  Reranking below); otherwise ranks by cosine similarity alone.
+  returns the matching passages with their source file and a relevance
+  score. Ranks by rerank (`RAG_RERANK_MODEL`) if set, else hybrid search
+  (`RAG_HYBRID_SEARCH=true`) if enabled, else plain cosine similarity — see
+  "Improving on plain vector search" below.
 - `list_documents()` — lists every file currently indexed
 - `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
   re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
@@ -206,22 +206,36 @@ re-run `src/ingest.py` while it's running — call `clear_cache()` afterward
 so it doesn't keep serving answers from the old index (`reindex_docs` does
 this automatically).
 
-### Reranking (optional)
+### Improving on plain vector search (optional)
 
 By default, `query_docs` ranks purely by embedding cosine similarity — fast
 and cheap, but it scores the query and each chunk independently, so it can
-miss subtleties a direct query/document comparison would catch. Set
-`RAG_RERANK_MODEL` (e.g. `rerank-2.5`) to add a rerank pass: the server
-fetches a larger candidate pool by vector search (`top_k × 4`, capped at 100)
-and re-scores those against the actual query text with Voyage's rerank API,
-returning the best `top_k` after that second pass.
+miss subtleties a direct query/document comparison (or an exact term/code
+match) would catch. Two ways to do better, in priority order if you set
+both — reranking wins:
 
-This costs its own tokens on every query, in addition to the query
-embedding — a rerank call processes full chunk text rather than just the
-short query, so it's typically the larger of the two costs. Check
-`usage_stats()` (it tracks rerank calls as their own `operation`) to see
-the actual cost for your usage pattern before deciding whether to leave it
-on.
+1. **Reranking** (`RAG_RERANK_MODEL`, e.g. `rerank-2.5`) — fetches a larger
+   candidate pool by vector search (`top_k × 4`, capped at 100) and
+   re-scores those against the actual query text with Voyage's rerank API,
+   returning the best `top_k` after that second pass. Always uses Voyage
+   regardless of `RAG_EMBED_PROVIDER` (no Azure/OpenAI equivalent exists).
+   Costs its own tokens on every query, in addition to the query
+   embedding — a rerank call processes full chunk text rather than just
+   the short query, so it's typically the larger of the two costs. Check
+   `usage_stats()` (it tracks rerank calls as their own `operation`) to see
+   the actual cost for your usage pattern before deciding whether to leave
+   it on.
+2. **Hybrid search** (`RAG_HYBRID_SEARCH=true`) — free and provider-agnostic:
+   fuses vector search with Postgres full-text search (`tsvector`/`ts_rank`)
+   via [reciprocal rank fusion](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion),
+   no API calls at all. Helps most on queries with specific terms, codes, or
+   names that cosine similarity alone tends to under-rank (an embedding
+   captures meaning, not exact tokens). If the full-text side finds nothing
+   for a given query (e.g. it's all stopwords), it degrades gracefully to
+   vector-only ranking rather than erroring.
+
+Only set one, or set `RAG_RERANK_MODEL` and treat `RAG_HYBRID_SEARCH` as a
+free fallback for when you want to unset rerank temporarily.
 
 ### Streaming
 
