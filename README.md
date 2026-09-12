@@ -438,6 +438,17 @@ or in `.mcp.json`:
 Either way, restart Claude Code (or run `/mcp` to reconnect) to pick up new
 or changed servers.
 
+### Included skill
+
+This repo ships a [Claude Code Skill](.claude/skills/search-docs/SKILL.md)
+(`search-docs`) that teaches Claude how to use these tools well: when a
+single `query_docs` call is enough versus when to check `list_documents()`
+first or issue several differently-phrased queries for a broad/cross-cutting
+question, when to call `reindex_docs()` proactively instead of telling you
+to run a command, and to respect the removal-safety guard rather than
+blindly overriding it. It's picked up automatically once this repo is your
+working directory — no separate install step.
+
 ## Contributing
 
 Issues and PRs welcome. This is a small, focused tool — keep additions in
