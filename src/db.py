@@ -59,6 +59,34 @@ def ensure_schema(conn):
             chunk_overlap INT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage_totals (
+            model TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            total_tokens BIGINT NOT NULL DEFAULT 0,
+            total_requests BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (model, operation)
+        )
+    """)
+
+
+def record_usage(conn, model: str, operation: str, tokens: int):
+    """operation is Voyage's input_type ('document' or 'query'). Recorded as
+    its own auto-committed statement (not inside any caller's transaction)
+    so it persists even if a later step in that transaction rolls back --
+    the API call happened and cost tokens regardless of what happens next."""
+    conn.execute(
+        """
+        INSERT INTO usage_totals (model, operation, total_tokens, total_requests, updated_at)
+        VALUES (%s, %s, %s, 1, now())
+        ON CONFLICT (model, operation) DO UPDATE SET
+            total_tokens = usage_totals.total_tokens + EXCLUDED.total_tokens,
+            total_requests = usage_totals.total_requests + 1,
+            updated_at = now()
+        """,
+        (model, operation, tokens),
+    )
 
 
 def get_voyage_client() -> voyageai.Client:
@@ -67,9 +95,15 @@ def get_voyage_client() -> voyageai.Client:
     return voyageai.Client(api_key=VOYAGE_API_KEY)
 
 
-def embed_texts(client: voyageai.Client, texts: list, input_type: str) -> list:
+def embed_texts(client: voyageai.Client, texts: list, input_type: str, conn=None) -> list:
     """input_type is 'document' when embedding chunks to index, 'query' when
     embedding a search query -- Voyage recommends both for best retrieval.
-    Returns pgvector.Vector objects, ready to bind as query parameters."""
+    Returns pgvector.Vector objects, ready to bind as query parameters.
+
+    Pass conn to record the real token usage this call reports (see
+    record_usage) -- optional so callers that don't care about tracking
+    (or don't have a connection handy) can skip it."""
     result = client.embed(texts, model=EMBED_MODEL, input_type=input_type, output_dimension=EMBED_DIM)
+    if conn is not None:
+        record_usage(conn, EMBED_MODEL, input_type, result.total_tokens)
     return [Vector(e) for e in result.embeddings]
