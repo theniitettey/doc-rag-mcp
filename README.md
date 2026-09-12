@@ -46,11 +46,35 @@ flowchart TD
 Both flows share one Postgres table (`doc_chunks`), namespaced by a
 `collection` column so multiple doc sets can coexist in the same database.
 
+### Choosing an embedding provider
+
+Set via `RAG_EMBED_PROVIDER` in `.env` before your first `ingest` — whichever
+you pick, `ingest.py` and `server.py` must agree (same `.env`), since
+switching later means the old embeddings are no longer comparable to new
+ones (see the rebuild notes in the Notes/next-steps section).
+
+- **`voyage`** (default) — Voyage AI's API. No local model download, just
+  `VOYAGE_API_KEY`.
+- **`azure-openai`** — your own Azure OpenAI embeddings deployment. Useful
+  if you already have Azure credits and don't want another vendor
+  subscription. Needs `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and
+  `AZURE_OPENAI_EMBED_DEPLOYMENT` (the deployment name, not the model name
+  — Azure routes by deployment).
+- **`openai`** — vanilla OpenAI, or any OpenAI-compatible endpoint (Ollama,
+  vLLM, etc.) via `OPENAI_BASE_URL`. Needs `OPENAI_API_KEY` and
+  `RAG_EMBED_MODEL` set to that endpoint's embedding model name.
+
+Reranking (`RAG_RERANK_MODEL`, see below) always uses Voyage's rerank API
+regardless of this choice — there's no Azure/OpenAI equivalent, and the two
+settings are otherwise independent (embed via Azure, still rerank via
+Voyage's free tier, if you want).
+
 ## 1. Install
 
 ```bash
 cd doc-rag-mcp
-cp .env.example .env   # fill in VOYAGE_API_KEY and POSTGRES_PASSWORD at least
+cp .env.example .env   # fill in credentials for your chosen RAG_EMBED_PROVIDER
+                        # (see above) and POSTGRES_PASSWORD at least
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -319,12 +343,14 @@ for source, content in rows:
   box — Voyage's best general-purpose/multilingual retrieval model as of
   this writing. For a cheaper/faster option try `voyage-4-lite` (same 1024
   default, same flexible 256/512/2048 options) — set `RAG_EMBED_MODEL` in
-  `.env`. Since the dimension is baked into the Postgres `vector` column,
-  changing `RAG_EMBED_DIM` (not needed for either of these two, since both
-  default to 1024) requires `make db-reset` (wipes all data) and a full
-  re-ingest; switching just the model name still forces a full re-embed
-  automatically (see chunking/rebuild notes above) since embeddings from
-  different models aren't comparable even at the same dimension.
+  `.env`. See "Choosing an embedding provider" above if you'd rather use
+  Azure OpenAI or another OpenAI-compatible endpoint instead of Voyage.
+  Since the dimension is baked into the Postgres `vector` column, changing
+  `RAG_EMBED_DIM` requires `make db-reset` (wipes all data) and a full
+  re-ingest; switching the model (or provider) still forces a full
+  re-embed automatically (see chunking/rebuild notes above) since
+  embeddings from different models aren't comparable even at the same
+  dimension.
 - **Scaling**: ingestion is already incremental (keyed by file hash), so
   re-running it stays cheap as the doc set grows. The `doc_chunks` table has
   an HNSW index for approximate nearest-neighbor search, which scales well
