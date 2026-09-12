@@ -3,9 +3,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Turn any folder of docs (PDFs, markdown, text) into a local, queryable
-knowledge base exposed as an [MCP](https://modelcontextprotocol.io) tool —
-so Claude Code (or any MCP client) can search your docs for relevant
-passages instead of reading whole files into its context window.
+knowledge base exposed as an [MCP](https://modelcontextprotocol.io) server
+— so any MCP-compatible agent (Claude Code, or otherwise) can search your
+docs for relevant passages instead of reading whole files into its context
+window. There's a [dedicated section](#claude-code) below for Claude Code
+specifics, since that's what this was built and tested against, but nothing
+about the server itself is Claude-specific.
 
 Embeddings run via the Voyage AI API (requires a `VOYAGE_API_KEY`, no
 multi-GB local model download); storage is Postgres with the `pgvector`
@@ -26,12 +29,12 @@ flowchart TD
     E --> F[(Postgres + pgvector)]
 ```
 
-**Querying** — Claude calls the MCP tool, which embeds the question and
+**Querying** — the agent calls the MCP tool, which embeds the question and
 finds the closest chunks by cosine similarity:
 
 ```mermaid
 flowchart TD
-    A[Claude Code] -- query_docs --> B[MCP server]
+    A[MCP client] -- query_docs --> B[MCP server]
     B --> C{cached?}
     C -- yes --> G[return cached answer]
     C -- no --> D[embed query via Voyage AI]
@@ -107,64 +110,50 @@ re-embed of everything (this also happens automatically if
 `RAG_EMBED_MODEL`, `RAG_CHUNK_SIZE`, or `RAG_CHUNK_OVERLAP` changed since
 the last run).
 
-## 4. Connect it to Claude Code
+## 4. Connect it to your MCP client
 
-Claude Code launches MCP servers itself over stdio — you don't run
-`src/server.py` manually. Register it with:
+Any MCP client connects one of two ways — both are covered in more detail
+in section 5 for the HTTP case:
 
-```bash
-claude mcp add local-docs -- /full/path/to/doc-rag-mcp/.venv/bin/python /full/path/to/doc-rag-mcp/src/server.py
-```
+- **stdio** (the common case for a local client): the client spawns
+  `src/server.py` itself as a subprocess, using your venv's python binary
+  so it picks up the installed packages:
 
-(Use the venv's python binary so it picks up the installed packages.)
+  ```text
+  /full/path/to/doc-rag-mcp/.venv/bin/python /full/path/to/doc-rag-mcp/src/server.py
+  ```
 
-Or generate `.mcp.json` automatically — `make gen-mcp-json` writes:
+  Most clients want that as a `command` + `args` pair in their own config
+  format — see your client's docs for exactly where that goes (for Claude
+  Code specifically, see the [dedicated section](#claude-code) below).
 
-- `local-docs`: stdio, with this machine's real venv path, `src/server.py`
-  path, and current `.env` values (`RAG_DATABASE_URL`, `RAG_COLLECTION`,
-  `VOYAGE_API_KEY`) filled in.
-- `local-docs-http`: only if `RAG_AUTH_TOKEN` is set (`make auth-token`) —
-  points at `http://localhost:<RAG_PORT>/mcp` with the real token as a
-  bearer header. This is for the server exposed *locally* by `make up`/
-  `make serve-http`, not a tunnel — for genuine remote access over a
-  tunnel (section 5 below), add that entry by hand with the actual tunnel
-  URL, since it can't be known in advance.
+- **HTTP**: the client connects to a URL instead of spawning anything —
+  see section 5 ("Run it on a network / behind a tunnel") for starting the
+  server this way and the auth token it requires.
 
-No manual editing either way, and it merges into an existing `.mcp.json`
-rather than overwriting it, so other hand-added entries survive. Re-run it
-any time `.env` changes (rotated password, different port, etc.).
-
-Prefer to write it by hand instead? `cp .mcp.json.example .mcp.json` and
-fill in the real venv path, password, and API key yourself (it ships with
-both the `local-docs` stdio entry below and the `local-docs-remote` HTTP
-entry from section 5; delete whichever you don't need):
-
-```json
-{
-  "mcpServers": {
-    "local-docs": {
-      "command": "/full/path/to/doc-rag-mcp/.venv/bin/python",
-      "args": ["/full/path/to/doc-rag-mcp/src/server.py"],
-      "env": {
-        "RAG_DATABASE_URL": "postgresql://raguser:yourpassword@localhost:5433/ragdb",
-        "RAG_COLLECTION": "project_docs",
-        "VOYAGE_API_KEY": "your-voyage-api-key"
-      }
-    }
-  }
-}
-```
-
-Restart Claude Code (or run `/mcp` to reconnect) and it will pick up four
-tools:
+Once connected, it exposes six tools:
 
 - `query_docs(query, top_k=5)` — semantic search over the indexed chunks,
   returns the matching passages with their source file and a relevance score
 - `list_documents()` — lists every file currently indexed
+- `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
+  re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
+  the chat to run `ingest.py` by hand. Incremental by default; blocks until
+  done (can take a while for a large/changed doc set); clears the query
+  cache automatically afterward. Refuses to remove a large fraction of
+  previously-indexed files in one go unless `confirm_large_removal=True` —
+  that pattern is much more often a misconfigured docs path than genuine
+  bulk deletion, and the response explains what was left untouched if it
+  trips.
 - `cache_stats()` — hit/miss counts, hit rate, and current cache size
-- `clear_cache()` — drop the query cache (run after re-running `src/ingest.py`)
+- `usage_stats()` — cumulative Voyage AI token usage (by model/operation)
+  plus cache stats, combined. This is a local tally of calls made through
+  this server/`ingest.py`, not your Voyage account's authoritative usage —
+  check the [dashboard](https://dashboard.voyageai.com) for that.
+- `clear_cache()` — drop the query cache (run after re-running `src/ingest.py`
+  directly; `reindex_docs` does this for you)
 
-Then just ask Claude Code things like "check the docs for how auth is
+Then just ask your agent things like "check the docs for how auth is
 handled" and it'll call `query_docs` on its own.
 
 ### Caching
@@ -180,22 +169,23 @@ the Postgres round-trip. Tune it with env vars:
 }
 ```
 
-The cache lives in the running server's memory, so it resets whenever Claude
-Code restarts the server, and it will **not** know if you re-run `src/ingest.py`
-while it's running — call `clear_cache()` afterward so it doesn't keep
-serving answers from the old index.
+The cache lives in the running server process's memory, so it resets
+whenever the client restarts the server, and it will **not** know if you
+re-run `src/ingest.py` while it's running — call `clear_cache()` afterward
+so it doesn't keep serving answers from the old index (`reindex_docs` does
+this automatically).
 
 ### Streaming
 
 MCP tool calls return one final result — there's no token-by-token streaming
 of the response body the way a chat completion streams. What the protocol
 *does* support is progress notifications sent while a tool is still
-running, and Claude Code surfaces those immediately rather than waiting on
-the final payload. `query_docs` reports progress as each matching chunk is
-resolved (and logs cache hit/miss), so you see activity right away instead
-of blocking until the whole joined string is ready — useful mainly on a
-cache miss with a larger `top_k`, or on the first call while the embedding
-model is loading.
+running; a client that surfaces those (Claude Code does) shows activity
+immediately rather than waiting on the final payload. `query_docs` reports
+progress as each matching chunk is resolved (and logs cache hit/miss), so
+you see activity right away instead of blocking until the whole joined
+string is ready — useful mainly on a cache miss with a larger `top_k`, or
+on the first call while the embedding model is loading.
 
 ## 5. Run it on a network / behind a tunnel
 
@@ -213,7 +203,8 @@ yet, and overwrites `RAG_AUTH_TOKEN` in place if it does — safe to re-run
 any time you want to rotate it. Clients need that token. The server refuses
 to start over `--transport http` without `RAG_AUTH_TOKEN` set, and every
 request must send `Authorization: Bearer <token>`; requests without it get
-a 401. Don't run this without a token — whatever's in `docs/` becomes readable to anyone with the URL and token.
+a 401. Don't run this without a token — whatever's in `docs/` becomes
+readable to anyone with the URL and token.
 
 Keep `--host 127.0.0.1` (the default) unless you specifically want the port
 open on your LAN — tunnel tools below connect *out* from your machine, so
@@ -251,30 +242,11 @@ ssh -R 8743:localhost:8743 user@your-vps
 
 ### Connecting a remote client
 
-For Claude Code, add it as an HTTP-type server rather than a `command`
-entry, either via:
-
-```bash
-claude mcp add --transport http local-docs-remote \
-  https://your-tunnel-url/mcp \
-  --header "Authorization: Bearer YOUR_TOKEN"
-```
-
-or in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "local-docs-remote": {
-      "type": "http",
-      "url": "https://your-tunnel-url/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_TOKEN"
-      }
-    }
-  }
-}
-```
+Register it as an HTTP-type MCP server rather than a `command`/stdio one —
+every client's config format is slightly different, so check your client's
+docs; it needs the tunnel URL (`https://your-tunnel-url/mcp`) and an
+`Authorization: Bearer YOUR_TOKEN` header. For Claude Code specifically,
+see the [dedicated section](#claude-code) below.
 
 Quick sanity check without any MCP client at all:
 
@@ -299,7 +271,7 @@ curl -i -H "Authorization: Bearer YOUR_TOKEN" \
   run it under `systemd`, `tmux`, or `pm2` rather than a bare foreground
   shell if you want it up long-term.
 
-## 6. Quick smoke test (optional, without Claude Code)
+## 6. Quick smoke test (optional, without any MCP client)
 
 ```bash
 PYTHONPATH=src python -c "
@@ -342,6 +314,83 @@ for source, content in rows:
   `--collection` name at ingest time and matching `RAG_COLLECTION` per MCP
   server entry — no extra database needed. Note the embedding dimension
   (`RAG_EMBED_DIM`) is shared across all collections in one database.
+
+## Claude Code
+
+Everything above works with any MCP client. This section is just the
+concrete Claude Code commands/config for the two connection modes from
+section 4.
+
+**stdio** (local, the default) — Claude Code launches the server itself:
+
+```bash
+claude mcp add local-docs -- /full/path/to/doc-rag-mcp/.venv/bin/python /full/path/to/doc-rag-mcp/src/server.py
+```
+
+Or generate `.mcp.json` automatically — `make gen-mcp-json` writes:
+
+- `local-docs`: stdio, with this machine's real venv path, `src/server.py`
+  path, and current `.env` values (`RAG_DATABASE_URL`, `RAG_COLLECTION`,
+  `VOYAGE_API_KEY`) filled in.
+- `local-docs-http`: only if `RAG_AUTH_TOKEN` is set (`make auth-token`) —
+  points at `http://localhost:<RAG_PORT>/mcp` with the real token as a
+  bearer header. This is for the server exposed *locally* by `make up`/
+  `make serve-http`, not a tunnel — for genuine remote access over a
+  tunnel (see below), add that entry by hand with the actual tunnel URL,
+  since it can't be known in advance.
+
+No manual editing either way, and it merges into an existing `.mcp.json`
+rather than overwriting it, so other hand-added entries survive. Re-run it
+any time `.env` changes (rotated password, different port, etc.).
+
+Prefer to write it by hand instead? `cp .mcp.json.example .mcp.json` and
+fill in the real venv path, password, and API key yourself (it ships with
+both a stdio entry and the HTTP entry below; delete whichever you don't
+need):
+
+```json
+{
+  "mcpServers": {
+    "local-docs": {
+      "command": "/full/path/to/doc-rag-mcp/.venv/bin/python",
+      "args": ["/full/path/to/doc-rag-mcp/src/server.py"],
+      "env": {
+        "RAG_DATABASE_URL": "postgresql://raguser:yourpassword@localhost:5433/ragdb",
+        "RAG_COLLECTION": "project_docs",
+        "VOYAGE_API_KEY": "your-voyage-api-key"
+      }
+    }
+  }
+}
+```
+
+**HTTP** (remote/tunnel, from section 5) — register it as an HTTP-type
+server rather than a `command` entry:
+
+```bash
+claude mcp add --transport http local-docs-remote \
+  https://your-tunnel-url/mcp \
+  --header "Authorization: Bearer YOUR_TOKEN"
+```
+
+or in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "local-docs-remote": {
+      "type": "http",
+      "url": "https://your-tunnel-url/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Either way, restart Claude Code (or run `/mcp` to reconnect) to pick up new
+or changed servers.
 
 ## Contributing
 
