@@ -70,7 +70,7 @@ CACHE_TTL_SECONDS = int(os.environ.get("RAG_CACHE_TTL_SECONDS", "600"))  # 10 mi
 
 AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")  # required for --transport http (see below)
 
-mcp = MCPServer("local-docs-rag")
+mcp = MCPServer("doc-rag-mcp")
 
 _conn = None
 _voyage = None
