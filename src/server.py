@@ -1,47 +1,9 @@
-"""
-src/server.py
+"""MCP server over the Postgres/pgvector knowledge base: query_docs,
+list_documents, reindex_docs, cache_stats, usage_stats, clear_cache. See
+README for transports, auth, caching, and reranking/hybrid search.
 
-Exposes the Postgres/pgvector-backed knowledge base as MCP tools:
-  - query_docs(query, top_k)  -> relevant chunks + sources (rerank >
-                                 hybrid search > plain vector search,
-                                 whichever's configured -- see below)
-  - list_documents()          -> every source file currently indexed
-  - reindex_docs(force_rebuild) -> re-run ingestion without leaving the chat
-  - cache_stats()             -> hit/miss counters and current cache size
-  - usage_stats()             -> embed/rerank API token usage + cache stats
-  - clear_cache()             -> drop the query cache (run after re-ingesting)
-
-Transports:
-  --transport stdio           (default) launched by a local MCP client
-                               (e.g. Claude Code) as a subprocess. No network
-                               exposure at all.
-  --transport http            Runs as a standalone HTTP server (Streamable
-                               HTTP, the current MCP network transport) that
-                               remote clients -- or a tunnel -- can reach.
-
-Auth: when running over http, set RAG_AUTH_TOKEN and every request must send
-`Authorization: Bearer <token>`. Running an unauthenticated server exposed to
-a tunnel means anyone with the URL can read your architecture docs -- don't
-skip this once you're off stdio.
-
-Caching: query results are cached in-memory (LRU, TTL) keyed by the
-normalized (query, top_k) pair, tracked with hit/miss counters -- see
-cache_stats(). The cache lives in this process's memory; call clear_cache()
-after re-running ingest.py so it doesn't keep serving answers from the old
-index.
-
-Streaming: MCP tool calls return a single final result -- there's no
-token-by-token streaming of the response body. What IS streamable are
-progress notifications sent while a tool is still running; query_docs
-reports progress per matched chunk (and logs cache hit/miss) so a client
-sees activity immediately instead of blocking on the fully assembled string.
-
-Examples:
-    # local only, used by Claude Code as a subprocess
-    python src/server.py --collection project_docs
-
-    # network-reachable, for a tunnel (see README for ngrok/cloudflared/tailscale)
-    RAG_AUTH_TOKEN=changeme python src/server.py --transport http --host 127.0.0.1 --port 8743
+    python src/server.py                   # stdio (default)
+    python src/server.py --transport http  # network-reachable
 """
 
 import argparse
