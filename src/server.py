@@ -78,7 +78,8 @@ AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")  # required for --transport http (
 mcp = MCPServer("doc-rag-mcp")
 
 _conn = None
-_voyage = None
+_embed_client = None
+_rerank_client = None
 
 
 def get_conn():
@@ -101,11 +102,22 @@ def run_query(fn):
         return fn(get_conn())
 
 
-def get_voyage():
-    global _voyage
-    if _voyage is None:
-        _voyage = db.get_voyage_client()
-    return _voyage
+def get_embed_client():
+    """Client for whichever RAG_EMBED_PROVIDER is configured (Voyage, Azure
+    OpenAI, or OpenAI-compatible) -- used for embedding, not reranking."""
+    global _embed_client
+    if _embed_client is None:
+        _embed_client = db.get_embed_client()
+    return _embed_client
+
+
+def get_rerank_client():
+    """Always Voyage -- reranking has no Azure/OpenAI equivalent, and is
+    unrelated to which provider embeds your documents."""
+    global _rerank_client
+    if _rerank_client is None:
+        _rerank_client = db.get_voyage_client()
+    return _rerank_client
 
 
 class QueryCache:
@@ -195,7 +207,7 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
         await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
 
     try:
-        query_embedding = db.embed_texts(get_voyage(), [query], input_type="query", conn=get_conn())[0]
+        query_embedding = db.embed_texts(get_embed_client(), [query], input_type="query", conn=get_conn())[0]
 
         # When reranking, over-fetch a larger candidate pool by cheap vector
         # search, then let the (more accurate, more expensive) reranker pick
@@ -218,7 +230,7 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
         # "higher is better", regardless of which path produced it.
         if db.RERANK_MODEL and candidates:
             documents = [c[2] for c in candidates]
-            ranked = db.rerank_texts(get_voyage(), query, documents, top_k, conn=get_conn())
+            ranked = db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=get_conn())
             rows = [(candidates[idx][0], candidates[idx][1], candidates[idx][2], score)
                     for idx, score in ranked]
         else:
