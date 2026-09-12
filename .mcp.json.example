@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "local-docs": {
+    "doc-rag-mcp": {
       "command": "/full/path/to/doc-rag-mcp/.venv/bin/python",
       "args": ["/full/path/to/doc-rag-mcp/src/server.py"],
       "env": {
@@ -9,7 +9,7 @@
         "VOYAGE_API_KEY": "your-voyage-api-key"
       }
     },
-    "local-docs-remote": {
+    "doc-rag-mcp-remote": {
       "type": "http",
       "url": "https://your-tunnel-url/mcp",
       "headers": {
