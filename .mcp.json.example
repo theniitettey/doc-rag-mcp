@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "local-docs": {
+      "command": "/full/path/to/doc-rag-mcp/.venv/bin/python",
+      "args": ["/full/path/to/doc-rag-mcp/src/server.py"],
+      "env": {
+        "RAG_DATABASE_URL": "postgresql://raguser:yourpassword@localhost:5433/ragdb",
+        "RAG_COLLECTION": "project_docs",
+        "VOYAGE_API_KEY": "your-voyage-api-key"
+      }
+    },
+    "local-docs-remote": {
+      "type": "http",
+      "url": "https://your-tunnel-url/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
+    }
+  }
+}
