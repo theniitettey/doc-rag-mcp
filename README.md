@@ -66,11 +66,13 @@ enough for the agent to call `reindex_docs()` on its own:
 
 ```mermaid
 sequenceDiagram
+    actor User
     actor Agent
     participant Server as MCP server
     participant FS as Docs folder
     participant DB as Postgres
 
+    User->>Agent: asks a question about the docs
     Agent->>Server: list_documents()
     Server->>FS: stat() every file (mtime + size)
     Server->>DB: last indexed mtime/size per source
@@ -81,6 +83,10 @@ sequenceDiagram
     Server->>Server: content-hash diff
     Server->>DB: embed + upsert changed files,<br/>delete chunks for removed files
     Server-->>Agent: "X new, Y changed, Z removed"
+    Agent->>Server: query_docs(question)
+    Server->>DB: vector (+ rerank/hybrid) search
+    Server-->>Agent: top-k relevant chunks
+    Agent-->>User: answer, grounded in fresh docs
 ```
 
 The `stat()` check is a fast heuristic, not the authoritative one — a
