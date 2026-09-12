@@ -134,7 +134,10 @@ in section 5 for the HTTP case:
 Once connected, it exposes six tools:
 
 - `query_docs(query, top_k=5)` — semantic search over the indexed chunks,
-  returns the matching passages with their source file and a relevance score
+  returns the matching passages with their source file and a relevance score.
+  If `RAG_RERANK_MODEL` is set, over-fetches candidates by vector search and
+  re-scores them with Voyage's rerank API for more accurate results (see
+  Reranking below); otherwise ranks by cosine similarity alone.
 - `list_documents()` — lists every file currently indexed
 - `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
   re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
@@ -174,6 +177,23 @@ whenever the client restarts the server, and it will **not** know if you
 re-run `src/ingest.py` while it's running — call `clear_cache()` afterward
 so it doesn't keep serving answers from the old index (`reindex_docs` does
 this automatically).
+
+### Reranking (optional)
+
+By default, `query_docs` ranks purely by embedding cosine similarity — fast
+and cheap, but it scores the query and each chunk independently, so it can
+miss subtleties a direct query/document comparison would catch. Set
+`RAG_RERANK_MODEL` (e.g. `rerank-2.5`) to add a rerank pass: the server
+fetches a larger candidate pool by vector search (`top_k × 4`, capped at 100)
+and re-scores those against the actual query text with Voyage's rerank API,
+returning the best `top_k` after that second pass.
+
+This costs its own tokens on every query, in addition to the query
+embedding — a rerank call processes full chunk text rather than just the
+short query, so it's typically the larger of the two costs. Check
+`usage_stats()` (it tracks rerank calls as their own `operation`) to see
+the actual cost for your usage pattern before deciding whether to leave it
+on.
 
 ### Streaming
 
