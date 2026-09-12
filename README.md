@@ -46,11 +46,35 @@ flowchart TD
 Both flows share one Postgres table (`doc_chunks`), namespaced by a
 `collection` column so multiple doc sets can coexist in the same database.
 
+### Choosing an embedding provider
+
+Set via `RAG_EMBED_PROVIDER` in `.env` before your first `ingest` — whichever
+you pick, `ingest.py` and `server.py` must agree (same `.env`), since
+switching later means the old embeddings are no longer comparable to new
+ones (see the rebuild notes in the Notes/next-steps section).
+
+- **`voyage`** (default) — Voyage AI's API. No local model download, just
+  `VOYAGE_API_KEY`.
+- **`azure-openai`** — your own Azure OpenAI embeddings deployment. Useful
+  if you already have Azure credits and don't want another vendor
+  subscription. Needs `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and
+  `AZURE_OPENAI_EMBED_DEPLOYMENT` (the deployment name, not the model name
+  — Azure routes by deployment).
+- **`openai`** — vanilla OpenAI, or any OpenAI-compatible endpoint (Ollama,
+  vLLM, etc.) via `OPENAI_BASE_URL`. Needs `OPENAI_API_KEY` and
+  `RAG_EMBED_MODEL` set to that endpoint's embedding model name.
+
+Reranking (`RAG_RERANK_MODEL`, see below) always uses Voyage's rerank API
+regardless of this choice — there's no Azure/OpenAI equivalent, and the two
+settings are otherwise independent (embed via Azure, still rerank via
+Voyage's free tier, if you want).
+
 ## 1. Install
 
 ```bash
 cd doc-rag-mcp
-cp .env.example .env   # fill in VOYAGE_API_KEY and POSTGRES_PASSWORD at least
+cp .env.example .env   # fill in credentials for your chosen RAG_EMBED_PROVIDER
+                        # (see above) and POSTGRES_PASSWORD at least
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -134,10 +158,10 @@ in section 5 for the HTTP case:
 Once connected, it exposes six tools:
 
 - `query_docs(query, top_k=5)` — semantic search over the indexed chunks,
-  returns the matching passages with their source file and a relevance score.
-  If `RAG_RERANK_MODEL` is set, over-fetches candidates by vector search and
-  re-scores them with Voyage's rerank API for more accurate results (see
-  Reranking below); otherwise ranks by cosine similarity alone.
+  returns the matching passages with their source file and a relevance
+  score. Ranks by rerank (`RAG_RERANK_MODEL`) if set, else hybrid search
+  (`RAG_HYBRID_SEARCH=true`) if enabled, else plain cosine similarity — see
+  "Improving on plain vector search" below.
 - `list_documents()` — lists every file currently indexed
 - `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
   re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
@@ -149,10 +173,14 @@ Once connected, it exposes six tools:
   bulk deletion, and the response explains what was left untouched if it
   trips.
 - `cache_stats()` — hit/miss counts, hit rate, and current cache size
-- `usage_stats()` — cumulative Voyage AI token usage (by model/operation)
-  plus cache stats, combined. This is a local tally of calls made through
-  this server/`ingest.py`, not your Voyage account's authoritative usage —
-  check the [dashboard](https://dashboard.voyageai.com) for that.
+- `usage_stats()` — cumulative embedding/rerank API token usage (by
+  model/operation, whichever `RAG_EMBED_PROVIDER` is active) plus cache
+  stats, combined. This is a local tally of calls made through this
+  server/`ingest.py`, not any provider's authoritative usage — check
+  [Voyage's dashboard](https://dashboard.voyageai.com), the Azure portal,
+  or [OpenAI's usage page](https://platform.openai.com/usage) for that,
+  depending on your provider. Reranking always shows up under Voyage
+  regardless of embed provider (see Reranking below).
 - `clear_cache()` — drop the query cache (run after re-running `src/ingest.py`
   directly; `reindex_docs` does this for you)
 
@@ -178,22 +206,36 @@ re-run `src/ingest.py` while it's running — call `clear_cache()` afterward
 so it doesn't keep serving answers from the old index (`reindex_docs` does
 this automatically).
 
-### Reranking (optional)
+### Improving on plain vector search (optional)
 
 By default, `query_docs` ranks purely by embedding cosine similarity — fast
 and cheap, but it scores the query and each chunk independently, so it can
-miss subtleties a direct query/document comparison would catch. Set
-`RAG_RERANK_MODEL` (e.g. `rerank-2.5`) to add a rerank pass: the server
-fetches a larger candidate pool by vector search (`top_k × 4`, capped at 100)
-and re-scores those against the actual query text with Voyage's rerank API,
-returning the best `top_k` after that second pass.
+miss subtleties a direct query/document comparison (or an exact term/code
+match) would catch. Two ways to do better, in priority order if you set
+both — reranking wins:
 
-This costs its own tokens on every query, in addition to the query
-embedding — a rerank call processes full chunk text rather than just the
-short query, so it's typically the larger of the two costs. Check
-`usage_stats()` (it tracks rerank calls as their own `operation`) to see
-the actual cost for your usage pattern before deciding whether to leave it
-on.
+1. **Reranking** (`RAG_RERANK_MODEL`, e.g. `rerank-2.5`) — fetches a larger
+   candidate pool by vector search (`top_k × 4`, capped at 100) and
+   re-scores those against the actual query text with Voyage's rerank API,
+   returning the best `top_k` after that second pass. Always uses Voyage
+   regardless of `RAG_EMBED_PROVIDER` (no Azure/OpenAI equivalent exists).
+   Costs its own tokens on every query, in addition to the query
+   embedding — a rerank call processes full chunk text rather than just
+   the short query, so it's typically the larger of the two costs. Check
+   `usage_stats()` (it tracks rerank calls as their own `operation`) to see
+   the actual cost for your usage pattern before deciding whether to leave
+   it on.
+2. **Hybrid search** (`RAG_HYBRID_SEARCH=true`) — free and provider-agnostic:
+   fuses vector search with Postgres full-text search (`tsvector`/`ts_rank`)
+   via [reciprocal rank fusion](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion),
+   no API calls at all. Helps most on queries with specific terms, codes, or
+   names that cosine similarity alone tends to under-rank (an embedding
+   captures meaning, not exact tokens). If the full-text side finds nothing
+   for a given query (e.g. it's all stopwords), it degrades gracefully to
+   vector-only ranking rather than erroring.
+
+Only set one, or set `RAG_RERANK_MODEL` and treat `RAG_HYBRID_SEARCH` as a
+free fallback for when you want to unset rerank temporarily.
 
 ### Streaming
 
@@ -319,12 +361,14 @@ for source, content in rows:
   box — Voyage's best general-purpose/multilingual retrieval model as of
   this writing. For a cheaper/faster option try `voyage-4-lite` (same 1024
   default, same flexible 256/512/2048 options) — set `RAG_EMBED_MODEL` in
-  `.env`. Since the dimension is baked into the Postgres `vector` column,
-  changing `RAG_EMBED_DIM` (not needed for either of these two, since both
-  default to 1024) requires `make db-reset` (wipes all data) and a full
-  re-ingest; switching just the model name still forces a full re-embed
-  automatically (see chunking/rebuild notes above) since embeddings from
-  different models aren't comparable even at the same dimension.
+  `.env`. See "Choosing an embedding provider" above if you'd rather use
+  Azure OpenAI or another OpenAI-compatible endpoint instead of Voyage.
+  Since the dimension is baked into the Postgres `vector` column, changing
+  `RAG_EMBED_DIM` requires `make db-reset` (wipes all data) and a full
+  re-ingest; switching the model (or provider) still forces a full
+  re-embed automatically (see chunking/rebuild notes above) since
+  embeddings from different models aren't comparable even at the same
+  dimension.
 - **Scaling**: ingestion is already incremental (keyed by file hash), so
   re-running it stays cheap as the doc set grows. The `doc_chunks` table has
   an HNSW index for approximate nearest-neighbor search, which scales well
@@ -411,6 +455,17 @@ or in `.mcp.json`:
 
 Either way, restart Claude Code (or run `/mcp` to reconnect) to pick up new
 or changed servers.
+
+### Included skill
+
+This repo ships a [Claude Code Skill](.claude/skills/search-docs/SKILL.md)
+(`search-docs`) that teaches Claude how to use these tools well: when a
+single `query_docs` call is enough versus when to check `list_documents()`
+first or issue several differently-phrased queries for a broad/cross-cutting
+question, when to call `reindex_docs()` proactively instead of telling you
+to run a command, and to respect the removal-safety guard rather than
+blindly overriding it. It's picked up automatically once this repo is your
+working directory — no separate install step.
 
 ## Contributing
 

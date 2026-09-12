@@ -106,16 +106,17 @@ def insert_chunk_rows(conn, collection: str, rel_path: str, file_hash_value: str
             )
 
 
-def embed_chunk_rows(conn, voyage, chunks: list, batch_size: int = 128) -> list:
-    """Embeds `chunks` via Voyage, batching. Returns (chunk_index, content,
-    embedding) rows ready for insert_chunk_rows. Records token usage against
-    conn as each batch call returns -- call this outside any transaction you
-    plan to roll back on later failure, so the usage record (tokens already
-    spent, real API calls already made) survives regardless."""
+def embed_chunk_rows(conn, embed_client, chunks: list, batch_size: int = 128) -> list:
+    """Embeds `chunks` via whichever provider RAG_EMBED_PROVIDER configures,
+    batching. Returns (chunk_index, content, embedding) rows ready for
+    insert_chunk_rows. Records token usage against conn as each batch call
+    returns -- call this outside any transaction you plan to roll back on
+    later failure, so the usage record (tokens already spent, real API
+    calls already made) survives regardless."""
     rows = []
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        embeddings = db.embed_texts(voyage, batch, input_type="document", conn=conn)
+        embeddings = db.embed_texts(embed_client, batch, input_type="document", conn=conn)
         rows.extend((i + j, chunk, embedding) for j, (chunk, embedding) in enumerate(zip(batch, embeddings)))
     return rows
 
@@ -163,8 +164,8 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
     captures lines to return as the tool result instead."""
     base_dir, files = collect_files(docs_path)
 
-    log(f"Found {len(files)} document(s). Using Voyage AI embedding model '{db.EMBED_MODEL}'...")
-    voyage = db.get_voyage_client()
+    log(f"Found {len(files)} document(s). Using {db.EMBED_PROVIDER} embedding model '{db.EMBED_MODEL}'...")
+    embed_client = db.get_embed_client()
     conn = db.get_connection()
 
     # Stored per collection so a later run can tell whether the index was
@@ -260,7 +261,7 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
         # forever.
         try:
             if rows is None:
-                rows = embed_chunk_rows(conn, voyage, chunks)
+                rows = embed_chunk_rows(conn, embed_client, chunks)
             with conn.transaction():
                 if is_update:
                     conn.execute("DELETE FROM doc_chunks WHERE collection = %s AND source = %s",

@@ -46,8 +46,10 @@ them confirm the docs path is actually right before forcing it through.
 
 Every `query_docs` call embeds the query (small, cheap) and, if
 `RAG_RERANK_MODEL` is configured, also reranks candidates (meaningfully
-more tokens, since it processes full chunk text). Check `usage_stats()` if
-the user asks about API costs, or if you're about to run many queries in a
-row and want to sanity-check the pattern -- it also shows cache hit rate,
-which is often the easier lever (repeated/similar questions should be
-cache hits, not fresh API calls).
+more tokens, since it processes full chunk text). If `RAG_HYBRID_SEARCH`
+is enabled instead, there's no extra API cost at all -- it fuses vector
+search with Postgres full-text search server-side. Check `usage_stats()`
+if the user asks about API costs, or if you're about to run many queries
+in a row and want to sanity-check the pattern -- it also shows cache hit
+rate, which is often the easier lever (repeated/similar questions should
+be cache hits, not fresh API calls).
