@@ -57,6 +57,49 @@ flowchart TD
     J --> A
 ```
 
+**Staying fresh** — the agent doesn't need the user to say "I changed the
+docs." `list_documents()` reports when the collection was last reindexed
+and, via a cheap `stat()`-only check (file mtime + size, no file content
+read — so this stays fast no matter how large the docs get), whether
+anything on disk looks new/changed/removed since. Seeing that signal is
+enough for the agent to call `reindex_docs()` on its own:
+
+```mermaid
+sequenceDiagram
+    actor User
+    actor Agent
+    participant Server as MCP server
+    participant FS as Docs folder
+    participant DB as Postgres
+
+    User->>Agent: asks a question about the docs
+    Agent->>Server: list_documents()
+    Server->>FS: stat() every file (mtime + size)
+    Server->>DB: last indexed mtime/size per source
+    Server-->>Agent: file list + "! N new, M changed, K removed -- reindex_docs()"
+    Note over Agent: notices the staleness signal,<br/>no user prompt needed
+    Agent->>Server: reindex_docs()
+    Server->>FS: re-read changed/new files
+    Server->>Server: content-hash diff
+    Server->>DB: embed + upsert changed files,<br/>delete chunks for removed files
+    Server-->>Agent: "X new, Y changed, Z removed"
+    Server->>Server: clear query cache<br/>(now stale)
+    Agent->>Server: query_docs(question)
+    alt cached
+        Server-->>Agent: cached answer, no API call
+    else not cached
+        Server->>DB: vector (+ rerank/hybrid) search
+        Server-->>Agent: top-k relevant chunks
+    end
+    Agent-->>User: answer, grounded in fresh docs
+```
+
+The `stat()` check is a fast heuristic, not the authoritative one — a
+touched-but-unedited file can show up as "changed" here. That's fine:
+the content-hash diffing in the ingestion flow above is what actually
+decides what gets re-embedded, and it correctly skips anything whose
+content didn't really change.
+
 Both flows share one Postgres table (`doc_chunks`), namespaced by a
 `collection` column so multiple doc sets can coexist in the same database.
 
@@ -179,7 +222,10 @@ Once connected, it exposes six tools:
   score. Ranks by rerank (`RAG_RERANK_MODEL`) if set, else hybrid search
   (`RAG_HYBRID_SEARCH=true`) if enabled, else plain cosine similarity — see
   "Improving on plain vector search" below.
-- `list_documents()` — lists every file currently indexed
+- `list_documents()` — lists every file currently indexed, when the
+  collection was last reindexed, and a fast staleness signal (new/changed/
+  removed files since then, detected via file mtime + size) — see
+  "Staying fresh" above
 - `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
   re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
   the chat to run `ingest.py` by hand. Incremental by default; blocks until

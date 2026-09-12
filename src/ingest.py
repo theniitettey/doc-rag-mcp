@@ -70,7 +70,17 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def insert_chunk_rows(conn, collection: str, rel_path: str, file_hash_value: str, chunk_rows: list):
+def file_stat(path: Path) -> tuple:
+    """(mtime, size) -- a cheap, stat()-only signature (no file content
+    read) stored alongside file_hash so a fast staleness check elsewhere
+    (list_documents' freshness signal) doesn't need to re-hash file
+    content on every call, only on files whose stat() actually changed."""
+    st = path.stat()
+    return st.st_mtime, st.st_size
+
+
+def insert_chunk_rows(conn, collection: str, rel_path: str, file_hash_value: str,
+                       file_mtime: float, file_size: int, chunk_rows: list):
     """chunk_rows: list of (chunk_index, content, embedding), already
     computed -- either freshly embedded or reused from identical content
     stored elsewhere (see find_duplicate_content)."""
@@ -79,14 +89,18 @@ def insert_chunk_rows(conn, collection: str, rel_path: str, file_hash_value: str
             chunk_id = hashlib.sha1(f"{collection}::{rel_path}::{chunk_index}".encode("utf-8")).hexdigest()
             cur.execute(
                 """
-                INSERT INTO doc_chunks (id, collection, source, chunk_index, file_hash, content, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO doc_chunks
+                    (id, collection, source, chunk_index, file_hash, file_mtime, file_size, content, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     file_hash = EXCLUDED.file_hash,
+                    file_mtime = EXCLUDED.file_mtime,
+                    file_size = EXCLUDED.file_size,
                     content = EXCLUDED.content,
                     embedding = EXCLUDED.embedding
                 """,
-                (chunk_id, collection, rel_path, chunk_index, file_hash_value, content, embedding),
+                (chunk_id, collection, rel_path, chunk_index, file_hash_value,
+                 file_mtime, file_size, content, embedding),
             )
 
 
@@ -174,14 +188,18 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
         conn.execute("DELETE FROM doc_chunks WHERE collection = %s", (collection,))
         stored_config = None
 
+    # last_indexed_at reflects when this ran, not whether anything actually
+    # changed -- "we checked at this time" is the useful signal for staleness
+    # detection, even on a run where every file was already up to date.
     conn.execute(
         """
-        INSERT INTO collection_config (collection, embed_model, chunk_size, chunk_overlap)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO collection_config (collection, embed_model, chunk_size, chunk_overlap, last_indexed_at)
+        VALUES (%s, %s, %s, %s, now())
         ON CONFLICT (collection) DO UPDATE SET
             embed_model = EXCLUDED.embed_model,
             chunk_size = EXCLUDED.chunk_size,
-            chunk_overlap = EXCLUDED.chunk_overlap
+            chunk_overlap = EXCLUDED.chunk_overlap,
+            last_indexed_at = EXCLUDED.last_indexed_at
         """,
         (collection, run_config["embed_model"], run_config["chunk_size"], run_config["chunk_overlap"]),
     )
@@ -201,6 +219,7 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
         current_sources.add(rel_path)
         try:
             hash_value = file_hash(path)
+            mtime, size = file_stat(path)
         except Exception as e:
             log(f"  ! Failed to hash {rel_path}: {e}")
             failed_count += 1
@@ -208,6 +227,15 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
 
         if existing_hashes.get(rel_path) == hash_value:
             skipped_count += 1
+            # Cheap backfill/refresh even on skip -- otherwise a file whose
+            # content hasn't changed since before file_mtime/file_size
+            # existed would keep NULL forever (never re-embedded, so never
+            # reaching insert_chunk_rows), permanently false-flagging as
+            # "changed" in list_documents' freshness check.
+            conn.execute(
+                "UPDATE doc_chunks SET file_mtime = %s, file_size = %s WHERE collection = %s AND source = %s",
+                (mtime, size, collection, rel_path),
+            )
             continue
 
         is_update = rel_path in existing_hashes
@@ -250,7 +278,7 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
                 if is_update:
                     conn.execute("DELETE FROM doc_chunks WHERE collection = %s AND source = %s",
                                  (collection, rel_path))
-                insert_chunk_rows(conn, collection, rel_path, hash_value, rows)
+                insert_chunk_rows(conn, collection, rel_path, hash_value, mtime, size, rows)
         except Exception as e:
             log(f"    ! Failed to embed/store {rel_path}: {e}")
             failed_count += 1

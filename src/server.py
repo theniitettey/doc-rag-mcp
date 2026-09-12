@@ -308,9 +308,67 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
     return answer
 
 
+def check_index_freshness():
+    """Cheap, read-only comparison between what's on disk (RAG_DOCS_DIR) and
+    what's actually indexed -- stat() only (mtime + size), no file content
+    reads at all, so this stays fast regardless of how large the doc set or
+    individual files get (unlike content hashing, which is O(total bytes)).
+    Lets a client notice the docs changed from the tool response itself,
+    without the user having to mention it.
+
+    This is a heuristic, not the authoritative check: a file touched but
+    not actually changed could show up as "changed" here. That's fine --
+    the real content-hash diffing that decides what to actually re-embed
+    already lives in reindex_docs()/ingest.py, which will correctly skip
+    anything whose content didn't change even if this flagged it.
+
+    Returns None if the docs path or DB can't be read (deleted folder,
+    permissions, etc.) -- list_documents() still works, it just won't
+    report freshness in that case."""
+    try:
+        docs_path = Path(os.environ.get("RAG_DOCS_DIR", "./docs")).resolve()
+        base_dir, files = ingest.collect_files(docs_path)
+    except Exception:
+        return None
+
+    try:
+        rows = run_query(lambda conn: conn.execute(
+            "SELECT DISTINCT ON (source) source, file_mtime, file_size FROM doc_chunks WHERE collection = %s",
+            (COLLECTION_NAME,),
+        ).fetchall())
+    except Exception:
+        return None
+    existing = {source: (mtime, size) for source, mtime, size in rows}
+
+    current_sources = set()
+    new_files, changed_files = [], []
+    for path in files:
+        rel_path = str(path.relative_to(base_dir))
+        current_sources.add(rel_path)
+        try:
+            mtime, size = ingest.file_stat(path)
+        except Exception:
+            continue
+        if rel_path not in existing:
+            new_files.append(rel_path)
+        else:
+            stored_mtime, stored_size = existing[rel_path]
+            # NULL means this row predates file_mtime/file_size existing --
+            # treat as "changed" (safer to over-flag once than silently miss
+            # it; the next real reindex will populate these fields).
+            if stored_mtime is None or stored_size is None or mtime != stored_mtime or size != stored_size:
+                changed_files.append(rel_path)
+
+    removed_files = sorted(set(existing) - current_sources)
+    return {"new": sorted(new_files), "changed": sorted(changed_files), "removed": removed_files}
+
+
 @mcp.tool()
 def list_documents() -> str:
-    """List every source document currently indexed in the knowledge base."""
+    """List every source document currently indexed, when the collection
+    was last reindexed, and whether the docs folder has changed since
+    (new/changed/removed files) -- so a client can notice staleness and
+    call reindex_docs() on its own, without the user having to say so."""
     try:
         rows = run_query(lambda conn: conn.execute(
             "SELECT DISTINCT source FROM doc_chunks WHERE collection = %s ORDER BY source",
@@ -320,7 +378,35 @@ def list_documents() -> str:
         return f"Failed to list documents: {e}"
     if not rows:
         return "No documents indexed yet. Run ingest.py first."
-    return "\n".join(source for (source,) in rows)
+    sources = [source for (source,) in rows]
+
+    try:
+        meta = run_query(lambda conn: conn.execute(
+            "SELECT last_indexed_at FROM collection_config WHERE collection = %s",
+            (COLLECTION_NAME,),
+        ).fetchone())
+    except Exception:
+        meta = None
+    last_indexed_at = meta[0] if meta else None
+
+    lines = [f"{len(sources)} document(s) indexed"
+             + (f", last reindexed {last_indexed_at}" if last_indexed_at else "") + "."]
+
+    freshness = check_index_freshness()
+    if freshness is None:
+        lines.append("(could not check the docs folder for changes)")
+    elif freshness["new"] or freshness["changed"] or freshness["removed"]:
+        lines.append(
+            f"! Docs folder has changed since last index: {len(freshness['new'])} new, "
+            f"{len(freshness['changed'])} changed, {len(freshness['removed'])} removed. "
+            "Call reindex_docs() to update."
+        )
+    else:
+        lines.append("Docs folder matches the index -- no reindex needed.")
+
+    lines.append("")
+    lines.extend(sources)
+    return "\n".join(lines)
 
 
 @mcp.tool()

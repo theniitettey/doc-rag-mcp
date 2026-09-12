@@ -79,6 +79,16 @@ def ensure_schema(conn):
         CREATE INDEX IF NOT EXISTS doc_chunks_content_tsv_idx
         ON doc_chunks USING gin (content_tsv)
     """)
+    # Fast (stat()-only, no file reads) staleness signal for list_documents()
+    # -- separate from file_hash, which is the authoritative content hash
+    # actual reindexing uses. NULL until the next real reindex populates
+    # them for rows written before this existed.
+    conn.execute("""
+        ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS file_mtime DOUBLE PRECISION
+    """)
+    conn.execute("""
+        ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS file_size BIGINT
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS collection_config (
             collection TEXT PRIMARY KEY,
@@ -86,6 +96,11 @@ def ensure_schema(conn):
             chunk_size INT NOT NULL,
             chunk_overlap INT NOT NULL
         )
+    """)
+    # Added via ALTER for the same reason as content_tsv above -- backfills
+    # existing collections instead of only applying to new ones.
+    conn.execute("""
+        ALTER TABLE collection_config ADD COLUMN IF NOT EXISTS last_indexed_at TIMESTAMPTZ
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS usage_totals (

@@ -30,11 +30,24 @@ use them instead of guessing at file contents or asking the user to paste docs i
 
 ## Keeping the index current
 
+`list_documents()` reports when the collection was last reindexed and
+whether the docs folder has changed since (new/changed/removed files),
+based on a fast file-timestamp check -- so you don't need the user to
+tell you docs changed. If it reports a `!` staleness line, call
+`reindex_docs()` yourself before answering from possibly-stale results,
+same as if the user had told you directly.
+
 If the user mentions they added, edited, or removed docs, call
 `reindex_docs()` yourself rather than telling them to run a command --
 that's exactly what it's for. It's incremental (unchanged files are
 skipped, no wasted API calls) and clears the query cache automatically
 when it finishes.
+
+The staleness check is a heuristic (mtime + size, not file content) --
+it can occasionally flag a file as changed when its content is actually
+identical (e.g. touched but not edited). That's fine: `reindex_docs()`'s
+own content-hash diffing will correctly skip anything that didn't
+actually change, so calling it on a false positive costs nothing.
 
 If `reindex_docs()` reports refusing to remove a large fraction of
 previously-indexed files, don't just retry with `confirm_large_removal=True`
