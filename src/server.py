@@ -44,12 +44,14 @@ Examples:
 
 import argparse
 import asyncio
+import hmac
 import os
 import time
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
 
+import psycopg
 import uvicorn
 from mcp.server.mcpserver import Context, MCPServer
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -58,6 +60,8 @@ from starlette.responses import JSONResponse
 
 import db
 import ingest
+
+MAX_TOP_K = 50
 
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "project_docs")
 
@@ -74,9 +78,22 @@ _voyage = None
 
 def get_conn():
     global _conn
-    if _conn is None:
+    if _conn is None or _conn.closed:
         _conn = db.get_connection()
     return _conn
+
+
+def run_query(fn):
+    """Call fn(conn) -> result. If the cached connection turns out to be
+    dead (Postgres restarted, a network blip) this reconnects once and
+    retries -- without it, a single dropped connection would break every
+    tool call until the process itself restarts."""
+    global _conn
+    try:
+        return fn(get_conn())
+    except psycopg.OperationalError:
+        _conn = None
+        return fn(get_conn())
 
 
 def get_voyage():
@@ -154,8 +171,14 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
 
     Args:
         query: Natural-language question or search phrase.
-        top_k: Number of chunks to return (default 5).
+        top_k: Number of chunks to return (default 5, max 50).
     """
+    if not query or not query.strip():
+        return "query must not be empty."
+    if top_k <= 0:
+        return "top_k must be a positive integer."
+    top_k = min(top_k, MAX_TOP_K)
+
     cached = _cache.get(query, top_k)
     if cached is not None:
         if ctx:
@@ -166,17 +189,22 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
     if ctx:
         await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
 
-    query_embedding = db.embed_texts(get_voyage(), [query], input_type="query", conn=get_conn())[0]
-    rows = get_conn().execute(
-        """
-        SELECT source, chunk_index, content, embedding <=> %s AS distance
-        FROM doc_chunks
-        WHERE collection = %s
-        ORDER BY embedding <=> %s
-        LIMIT %s
-        """,
-        (query_embedding, COLLECTION_NAME, query_embedding, top_k),
-    ).fetchall()
+    try:
+        query_embedding = db.embed_texts(get_voyage(), [query], input_type="query", conn=get_conn())[0]
+        rows = run_query(lambda conn: conn.execute(
+            """
+            SELECT source, chunk_index, content, embedding <=> %s AS distance
+            FROM doc_chunks
+            WHERE collection = %s
+            ORDER BY embedding <=> %s
+            LIMIT %s
+            """,
+            (query_embedding, COLLECTION_NAME, query_embedding, top_k),
+        ).fetchall())
+    except Exception as e:
+        if ctx:
+            await ctx.info(f"query failed: {e}")
+        return f"Query failed: {e}"
 
     if not rows:
         answer = "No relevant results found in the knowledge base."
@@ -201,10 +229,13 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
 @mcp.tool()
 def list_documents() -> str:
     """List every source document currently indexed in the knowledge base."""
-    rows = get_conn().execute(
-        "SELECT DISTINCT source FROM doc_chunks WHERE collection = %s ORDER BY source",
-        (COLLECTION_NAME,),
-    ).fetchall()
+    try:
+        rows = run_query(lambda conn: conn.execute(
+            "SELECT DISTINCT source FROM doc_chunks WHERE collection = %s ORDER BY source",
+            (COLLECTION_NAME,),
+        ).fetchall())
+    except Exception as e:
+        return f"Failed to list documents: {e}"
     if not rows:
         return "No documents indexed yet. Run ingest.py first."
     return "\n".join(source for (source,) in rows)
@@ -227,10 +258,13 @@ def usage_stats() -> str:
     ingest.py/this server, NOT your account's authoritative usage or
     remaining free-tier balance (check https://dashboard.voyageai.com for
     that -- this can't see usage from a shared API key used elsewhere)."""
-    rows = get_conn().execute(
-        "SELECT model, operation, total_tokens, total_requests, updated_at "
-        "FROM usage_totals ORDER BY model, operation"
-    ).fetchall()
+    try:
+        rows = run_query(lambda conn: conn.execute(
+            "SELECT model, operation, total_tokens, total_requests, updated_at "
+            "FROM usage_totals ORDER BY model, operation"
+        ).fetchall())
+    except Exception as e:
+        return f"Failed to read usage stats: {e}"
 
     lines = ["-- Voyage AI usage (this knowledge base only) --"]
     if not rows:
@@ -264,7 +298,8 @@ _reindex_lock = asyncio.Lock()
 
 
 @mcp.tool()
-async def reindex_docs(force_rebuild: bool = False, ctx: Context = None) -> str:
+async def reindex_docs(force_rebuild: bool = False, confirm_large_removal: bool = False,
+                        ctx: Context = None) -> str:
     """Re-scan RAG_DOCS_DIR and embed any new or changed files into the
     knowledge base, without leaving the chat to run ingest.py by hand.
 
@@ -278,6 +313,12 @@ async def reindex_docs(force_rebuild: bool = False, ctx: Context = None) -> str:
         force_rebuild: Ignore stored file hashes and re-embed every file,
             even ones that haven't changed. Also happens automatically if
             the embedding model or chunk settings changed since the last run.
+        confirm_large_removal: Allow removing a large fraction of
+            previously-indexed files in one run. Refused by default as a
+            safety net: that pattern is much more often a misconfigured
+            RAG_DOCS_DIR (wrong folder, an empty mount) than genuine bulk
+            deletion -- the response explains what was left untouched if
+            this trips, and small day-to-day removals are never affected.
     """
     if _reindex_lock.locked():
         return "A reindex is already running -- wait for it to finish before starting another."
@@ -294,7 +335,8 @@ async def reindex_docs(force_rebuild: bool = False, ctx: Context = None) -> str:
             # Runs in a worker thread so the rest of the server (health
             # checks, other tool calls) stays responsive while this --
             # potentially multi-minute -- ingestion runs.
-            await asyncio.to_thread(ingest.build_index, docs_path, COLLECTION_NAME, force_rebuild, lines.append)
+            await asyncio.to_thread(ingest.build_index, docs_path, COLLECTION_NAME, force_rebuild,
+                                     lines.append, confirm_large_removal)
         except (SystemExit, Exception) as e:
             error = str(e)
         finally:
@@ -316,14 +358,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/health":
             return await call_next(request)
         expected = f"Bearer {AUTH_TOKEN}"
-        if request.headers.get("authorization") != expected:
+        actual = request.headers.get("authorization") or ""
+        # Constant-time compare -- a plain != leaks how many leading
+        # characters matched via response timing, which a naive brute-force
+        # could exploit over enough attempts.
+        if not hmac.compare_digest(actual, expected):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
 
 async def health(request: Request) -> JSONResponse:
     try:
-        get_conn().execute("SELECT 1")
+        run_query(lambda conn: conn.execute("SELECT 1"))
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
     return JSONResponse({"status": "ok"})
