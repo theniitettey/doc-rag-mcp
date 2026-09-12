@@ -106,13 +106,16 @@ def insert_chunk_rows(conn, collection: str, rel_path: str, file_hash_value: str
             )
 
 
-def embed_chunk_rows(voyage, chunks: list, batch_size: int = 128) -> list:
+def embed_chunk_rows(conn, voyage, chunks: list, batch_size: int = 128) -> list:
     """Embeds `chunks` via Voyage, batching. Returns (chunk_index, content,
-    embedding) rows ready for insert_chunk_rows."""
+    embedding) rows ready for insert_chunk_rows. Records token usage against
+    conn as each batch call returns -- call this outside any transaction you
+    plan to roll back on later failure, so the usage record (tokens already
+    spent, real API calls already made) survives regardless."""
     rows = []
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        embeddings = db.embed_texts(voyage, batch, input_type="document")
+        embeddings = db.embed_texts(voyage, batch, input_type="document", conn=conn)
         rows.extend((i + j, chunk, embedding) for j, (chunk, embedding) in enumerate(zip(batch, embeddings)))
     return rows
 
@@ -153,10 +156,13 @@ def collect_files(docs_path: Path):
     raise SystemExit(f"{docs_path} does not exist -- set RAG_DOCS_DIR to an existing file or folder")
 
 
-def build_index(docs_path: Path, collection: str, force_rebuild: bool = False):
+def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, log=print):
+    """log: called with one line of progress text at a time -- defaults to
+    print() for CLI use; the MCP reindex_docs tool passes a callback that
+    captures lines to return as the tool result instead."""
     base_dir, files = collect_files(docs_path)
 
-    print(f"Found {len(files)} document(s). Using Voyage AI embedding model '{db.EMBED_MODEL}'...")
+    log(f"Found {len(files)} document(s). Using Voyage AI embedding model '{db.EMBED_MODEL}'...")
     voyage = db.get_voyage_client()
     conn = db.get_connection()
 
@@ -174,7 +180,7 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False):
 
     if stored_config is not None and not force_rebuild:
         if tuple(run_config.values()) != stored_config:
-            print("Embedding model or chunk settings changed since the last run — "
+            log("Embedding model or chunk settings changed since the last run — "
                   "forcing a full rebuild (old embeddings aren't comparable to new ones).")
             force_rebuild = True
 
@@ -210,7 +216,7 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False):
         try:
             hash_value = file_hash(path)
         except Exception as e:
-            print(f"  ! Failed to hash {rel_path}: {e}")
+            log(f"  ! Failed to hash {rel_path}: {e}")
             failed_count += 1
             continue
 
@@ -227,37 +233,44 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False):
         rows = duplicate_rows  # None unless a duplicate was found
 
         if duplicate_rows is not None:
-            print(f"  {'Updating' if is_update else 'Reading'} {rel_path} ... "
+            log(f"  {'Updating' if is_update else 'Reading'} {rel_path} ... "
                   f"duplicate content of an already-indexed file -- reusing embeddings, no API call")
         else:
-            print(f"  {'Updating' if is_update else 'Reading'} {rel_path} ...")
+            log(f"  {'Updating' if is_update else 'Reading'} {rel_path} ...")
             try:
                 text = load_document(path)
             except Exception as e:
-                print(f"    ! Failed to read {rel_path}: {e}")
+                log(f"    ! Failed to read {rel_path}: {e}")
                 failed_count += 1
                 continue
             chunks = chunk_text(text)
 
-        # Atomic per file: if this is interrupted (Ctrl+C, a Voyage API
-        # error, a network blip) partway through, the transaction rolls
-        # back so no partial chunk set is left behind under this file's
-        # hash -- otherwise a future run would see the hash unchanged and
-        # skip it, silently leaving it half-indexed forever.
+        # Embedding happens outside the transaction below on purpose: those
+        # tokens are spent (usage recorded) the moment the API call
+        # returns, regardless of whether the DB write that follows
+        # succeeds -- rolling back the write shouldn't roll back the fact
+        # that the call happened and cost tokens.
+        #
+        # The write itself (delete + insert) IS atomic per file: if this is
+        # interrupted (Ctrl+C, a network blip) partway through, the
+        # transaction rolls back so no partial chunk set is left behind
+        # under this file's hash -- otherwise a future run would see the
+        # hash unchanged and skip it, silently leaving it half-indexed
+        # forever.
         try:
+            if rows is None:
+                rows = embed_chunk_rows(conn, voyage, chunks)
             with conn.transaction():
                 if is_update:
                     conn.execute("DELETE FROM doc_chunks WHERE collection = %s AND source = %s",
                                  (collection, rel_path))
-                if rows is None:
-                    rows = embed_chunk_rows(voyage, chunks)
                 insert_chunk_rows(conn, collection, rel_path, hash_value, rows)
         except Exception as e:
-            print(f"    ! Failed to embed/store {rel_path}: {e}")
+            log(f"    ! Failed to embed/store {rel_path}: {e}")
             failed_count += 1
             continue
 
-        print(f"    -> {len(rows)} chunk(s)")
+        log(f"    -> {len(rows)} chunk(s)")
         updated_count += 1 if is_update else 0
         added_count += 0 if is_update else 1
 
@@ -269,10 +282,10 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False):
         "SELECT count(*) FROM doc_chunks WHERE collection = %s", (collection,)
     ).fetchone()[0]
 
-    print(f"Done. {added_count} new file(s), {updated_count} changed file(s), "
+    log(f"Done. {added_count} new file(s), {updated_count} changed file(s), "
           f"{skipped_count} unchanged (skipped), {len(removed_sources)} removed"
           + (f", {failed_count} failed" if failed_count else "") + ".")
-    print(f"Collection '{collection}' now has {total_chunks} chunks stored in Postgres.")
+    log(f"Collection '{collection}' now has {total_chunks} chunks stored in Postgres.")
 
 
 if __name__ == "__main__":
