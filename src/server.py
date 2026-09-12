@@ -118,10 +118,12 @@ def get_embed_client():
 
 def get_rerank_client():
     """Always Voyage -- reranking has no Azure/OpenAI equivalent, and is
-    unrelated to which provider embeds your documents."""
+    unrelated to which provider embeds your documents. Raises ValueError
+    (caught by query_docs) if that's a cross-provider data-egress surprise
+    the user hasn't explicitly acknowledged -- see db.get_rerank_client."""
     global _rerank_client
     if _rerank_client is None:
-        _rerank_client = db.get_voyage_client()
+        _rerank_client = db.get_rerank_client()
     return _rerank_client
 
 
@@ -315,7 +317,11 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
             candidates = fetch_vector_candidates(query_embedding, top_k)
             rows = [(source, chunk_idx, content, 1 - distance)
                     for _id, source, chunk_idx, content, distance in candidates]
-    except Exception as e:
+    except (SystemExit, Exception) as e:
+        # SystemExit included deliberately: get_embed_client()/
+        # get_rerank_client() raise it for missing provider config, and
+        # that's a per-request condition here (a misconfigured env var),
+        # not something that should actually tear down the server process.
         if ctx:
             await ctx.info(f"query failed: {e}")
         return f"Query failed: {e}"
