@@ -1,0 +1,91 @@
+# Usage (see the Makefile for the `make` target these map to):
+#   1. Put your docs in ./docs (same folder this file is in).
+#   2. Set POSTGRES_PASSWORD, RAG_AUTH_TOKEN, and VOYAGE_API_KEY in a .env
+#      file next to this compose file:
+#        cp .env.example .env
+#        make auth-token                          # generates RAG_AUTH_TOKEN
+#        echo "VOYAGE_API_KEY=..." >> .env
+#        echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+#   3. Build the index:            make reindex
+#   4. Start the server:           make up
+#   5. Re-index after doc changes: make reindex
+#                                  (incremental -- only new/changed files
+#                                  are re-embedded; `make reindex-rebuild`
+#                                  forces a full re-embed)
+#                                  make clear-cache
+#                                  (or just: docker compose restart rag-mcp)
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+    ports:
+      # Loopback only, so `make db` + a local (non-Docker) ingest.py/server.py
+      # can reach it via RAG_DATABASE_URL=...@localhost:5433/...
+      # (5433, not 5432, to avoid clashing with another project's Postgres)
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raguser} -d ${POSTGRES_DB:-ragdb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  rag-mcp:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Bind to the host's loopback only -- a tunnel tool (cloudflared/
+      # ngrok/tailscale) running on the host connects to this locally and
+      # handles the actual internet-facing exposure. Change to
+      # "${RAG_PORT:-8743}:${RAG_PORT:-8743}" only if you specifically want
+      # it open on your LAN. RAG_PORT deliberately defaults away from
+      # 8000/5000/3000 since those are usually already taken by something
+      # else on a dev machine.
+      - "127.0.0.1:${RAG_PORT:-8743}:${RAG_PORT:-8743}"
+    environment:
+      RAG_AUTH_TOKEN: ${RAG_AUTH_TOKEN:?set RAG_AUTH_TOKEN in .env}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:?set VOYAGE_API_KEY in .env}
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-voyage-4-large}
+      RAG_EMBED_DIM: ${RAG_EMBED_DIM:-1024}
+      RAG_COLLECTION: ${RAG_COLLECTION:-project_docs}
+      RAG_CACHE_MAX_SIZE: ${RAG_CACHE_MAX_SIZE:-256}
+      RAG_CACHE_TTL_SECONDS: ${RAG_CACHE_TTL_SECONDS:-600}
+      RAG_PORT: ${RAG_PORT:-8743}
+      RAG_DATABASE_URL: postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+    volumes:
+      - ./docs:/data/docs:ro
+      # Live-mounted (read-only) so code edits take effect on `make restart`
+      # alone -- no rebuild needed. Only requirements.txt/Dockerfile changes
+      # still need `make redeploy` (they're baked into the image, not
+      # mounted).
+      - ./src:/app/src:ro
+    restart: unless-stopped
+
+  # One-off: `docker compose run --rm ingest` builds/rebuilds the index
+  # using the same image and volumes as the server, then exits.
+  ingest:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:?set VOYAGE_API_KEY in .env}
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-voyage-4-large}
+      RAG_EMBED_DIM: ${RAG_EMBED_DIM:-1024}
+      RAG_COLLECTION: ${RAG_COLLECTION:-project_docs}
+      RAG_DATABASE_URL: postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+    volumes:
+      - ./docs:/data/docs:ro
+      - ./src:/app/src:ro
+    entrypoint: ["python", "src/ingest.py", "--docs", "/data/docs"]
+
+volumes:
+  pg_data:
