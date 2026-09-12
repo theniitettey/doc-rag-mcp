@@ -156,7 +156,8 @@ def collect_files(docs_path: Path):
     raise SystemExit(f"{docs_path} does not exist -- set RAG_DOCS_DIR to an existing file or folder")
 
 
-def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, log=print):
+def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, log=print,
+                 confirm_large_removal: bool = False):
     """log: called with one line of progress text at a time -- defaults to
     print() for CLI use; the MCP reindex_docs tool passes a callback that
     captures lines to return as the tool result instead."""
@@ -275,8 +276,22 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
         added_count += 0 if is_update else 1
 
     removed_sources = set(existing_hashes) - current_sources
-    for rel_path in removed_sources:
-        conn.execute("DELETE FROM doc_chunks WHERE collection = %s AND source = %s", (collection, rel_path))
+    # A large fraction of previously-indexed files "disappearing" in one run
+    # is much more often a misconfigured/mismatched RAG_DOCS_DIR (wrong
+    # folder, an empty mount) than genuine mass deletion -- refuse to act on
+    # it silently. Small removals (typical day-to-day doc churn) go through
+    # as before.
+    removal_threshold = max(3, len(existing_hashes) * 0.5)
+    if removed_sources and len(removed_sources) >= removal_threshold and not confirm_large_removal:
+        log(f"! Refusing to remove {len(removed_sources)} of {len(existing_hashes)} previously-indexed "
+            f"file(s) automatically -- this usually means the docs path points somewhere unexpected "
+            f"rather than genuine deletions. Re-run with --confirm-removal (CLI) or "
+            f"confirm_large_removal=True (reindex_docs) if this is intentional. Not removed: "
+            f"{', '.join(sorted(removed_sources))}")
+        removed_sources = set()
+    else:
+        for rel_path in removed_sources:
+            conn.execute("DELETE FROM doc_chunks WHERE collection = %s AND source = %s", (collection, rel_path))
 
     total_chunks = conn.execute(
         "SELECT count(*) FROM doc_chunks WHERE collection = %s", (collection,)
@@ -297,6 +312,11 @@ if __name__ == "__main__":
     parser.add_argument("--rebuild", action="store_true",
                          default=os.environ.get("RAG_FORCE_REBUILD", "").lower() in ("1", "true", "yes"),
                          help="Force a full re-embed of every file, ignoring stored file hashes")
+    parser.add_argument("--confirm-removal", action="store_true",
+                         default=os.environ.get("RAG_CONFIRM_REMOVAL", "").lower() in ("1", "true", "yes"),
+                         help="Allow removing a large fraction of previously-indexed files in one run "
+                              "(otherwise refused as a likely misconfigured docs path)")
     args = parser.parse_args()
 
-    build_index(Path(args.docs).resolve(), args.collection, force_rebuild=args.rebuild)
+    build_index(Path(args.docs).resolve(), args.collection, force_rebuild=args.rebuild,
+                confirm_large_removal=args.confirm_removal)
