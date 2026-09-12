@@ -66,16 +66,24 @@ indexed data).
 
 ## 2. Add your docs
 
-Drop your docs into `docs/` (subfolders are fine) — architecture docs,
-runbooks, research papers, whatever you've got:
+Two ways to point at your docs, via `RAG_DOCS_DIR` in `.env`:
 
-```
-docs/
-  architecture-overview.md
-  api-design.pdf
-  adr/
-    0001-use-postgres.md
-```
+- **Drop them in `docs/`** (the default, subfolders are fine) — architecture
+  docs, runbooks, research papers, whatever you've got:
+
+  ```text
+  docs/
+    architecture-overview.md
+    api-design.pdf
+    adr/
+      0001-use-postgres.md
+  ```
+
+- **Or point at any path already on your machine** — a folder or a single
+  file, anywhere: `RAG_DOCS_DIR=/Users/you/Documents/some-project-docs`. No
+  need to copy anything into this repo. (Docker only sees what's mounted
+  into `docs/`, so this option is for running `ingest.py`/`make ingest`
+  locally rather than via `make reindex`.)
 
 Supported: `.pdf`, `.md`, `.markdown`, `.txt`.
 
