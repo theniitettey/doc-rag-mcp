@@ -155,14 +155,23 @@ entry from section 5; delete whichever you don't need):
 }
 ```
 
-Restart Claude Code (or run `/mcp` to reconnect) and it will pick up four
+Restart Claude Code (or run `/mcp` to reconnect) and it will pick up six
 tools:
 
 - `query_docs(query, top_k=5)` — semantic search over the indexed chunks,
   returns the matching passages with their source file and a relevance score
 - `list_documents()` — lists every file currently indexed
+- `reindex_docs(force_rebuild=False)` — re-scan `RAG_DOCS_DIR` and embed
+  anything new or changed, without leaving the chat to run `ingest.py` by
+  hand. Incremental by default; blocks until done (can take a while for a
+  large/changed doc set); clears the query cache automatically afterward.
 - `cache_stats()` — hit/miss counts, hit rate, and current cache size
-- `clear_cache()` — drop the query cache (run after re-running `src/ingest.py`)
+- `usage_stats()` — cumulative Voyage AI token usage (by model/operation)
+  plus cache stats, combined. This is a local tally of calls made through
+  this server/`ingest.py`, not your Voyage account's authoritative usage —
+  check the [dashboard](https://dashboard.voyageai.com) for that.
+- `clear_cache()` — drop the query cache (run after re-running `src/ingest.py`
+  directly; `reindex_docs` does this for you)
 
 Then just ask Claude Code things like "check the docs for how auth is
 handled" and it'll call `query_docs` on its own.
