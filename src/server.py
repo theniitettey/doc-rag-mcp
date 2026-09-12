@@ -1,0 +1,282 @@
+"""
+src/server.py
+
+Exposes the Postgres/pgvector-backed knowledge base as MCP tools:
+  - query_docs(query, top_k)  -> relevant chunks + sources
+  - list_documents()          -> every source file currently indexed
+  - cache_stats()             -> hit/miss counters and current cache size
+  - clear_cache()             -> drop the query cache (run after re-ingesting)
+
+Transports:
+  --transport stdio           (default) launched by a local MCP client
+                               (e.g. Claude Code) as a subprocess. No network
+                               exposure at all.
+  --transport http            Runs as a standalone HTTP server (Streamable
+                               HTTP, the current MCP network transport) that
+                               remote clients -- or a tunnel -- can reach.
+
+Auth: when running over http, set RAG_AUTH_TOKEN and every request must send
+`Authorization: Bearer <token>`. Running an unauthenticated server exposed to
+a tunnel means anyone with the URL can read your architecture docs -- don't
+skip this once you're off stdio.
+
+Caching: query results are cached in-memory (LRU, TTL) keyed by the
+normalized (query, top_k) pair, tracked with hit/miss counters -- see
+cache_stats(). The cache lives in this process's memory; call clear_cache()
+after re-running ingest.py so it doesn't keep serving answers from the old
+index.
+
+Streaming: MCP tool calls return a single final result -- there's no
+token-by-token streaming of the response body. What IS streamable are
+progress notifications sent while a tool is still running; query_docs
+reports progress per matched chunk (and logs cache hit/miss) so a client
+sees activity immediately instead of blocking on the fully assembled string.
+
+Examples:
+    # local only, used by Claude Code as a subprocess
+    python src/server.py --collection project_docs
+
+    # network-reachable, for a tunnel (see README for ngrok/cloudflared/tailscale)
+    RAG_AUTH_TOKEN=changeme python src/server.py --transport http --host 127.0.0.1 --port 8743
+"""
+
+import argparse
+import os
+import time
+from collections import OrderedDict
+from threading import Lock
+
+import uvicorn
+from mcp.server.mcpserver import Context, MCPServer
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+import db
+
+COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "project_docs")
+
+CACHE_MAX_SIZE = int(os.environ.get("RAG_CACHE_MAX_SIZE", "256"))
+CACHE_TTL_SECONDS = int(os.environ.get("RAG_CACHE_TTL_SECONDS", "600"))  # 10 min default
+
+AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")  # required for --transport http (see below)
+
+mcp = MCPServer("local-docs-rag")
+
+_conn = None
+_voyage = None
+
+
+def get_conn():
+    global _conn
+    if _conn is None:
+        _conn = db.get_connection()
+    return _conn
+
+
+def get_voyage():
+    global _voyage
+    if _voyage is None:
+        _voyage = db.get_voyage_client()
+    return _voyage
+
+
+class QueryCache:
+    """Thread-safe LRU cache with a TTL, plus hit/miss counters."""
+
+    def __init__(self, max_size: int, ttl_seconds: int):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._store = OrderedDict()  # key -> (timestamp, value)
+        self._lock = Lock()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def make_key(query: str, top_k: int) -> tuple:
+        return (query.strip().lower(), top_k)
+
+    def get(self, query: str, top_k: int):
+        key = self.make_key(query, top_k)
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            timestamp, value = entry
+            if time.time() - timestamp > self.ttl_seconds:
+                del self._store[key]
+                self.misses += 1
+                return None
+            self._store.move_to_end(key)
+            self.hits += 1
+            return value
+
+    def set(self, query: str, top_k: int, value: str):
+        key = self.make_key(query, top_k)
+        with self._lock:
+            self._store[key] = (time.time(), value)
+            self._store.move_to_end(key)
+            while len(self._store) > self.max_size:
+                self._store.popitem(last=False)
+
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+            self.hits = 0
+            self.misses = 0
+
+    def stats(self) -> dict:
+        with self._lock:
+            total = self.hits + self.misses
+            hit_rate = (self.hits / total) if total else 0.0
+            return {
+                "size": len(self._store),
+                "max_size": self.max_size,
+                "ttl_seconds": self.ttl_seconds,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": round(hit_rate, 3),
+            }
+
+
+_cache = QueryCache(CACHE_MAX_SIZE, CACHE_TTL_SECONDS)
+
+
+@mcp.tool()
+async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
+    """Search the project's architecture docs and PDFs for relevant passages.
+
+    Args:
+        query: Natural-language question or search phrase.
+        top_k: Number of chunks to return (default 5).
+    """
+    cached = _cache.get(query, top_k)
+    if cached is not None:
+        if ctx:
+            await ctx.info(f"cache hit for query '{query}' (top_k={top_k})")
+            await ctx.report_progress(1, 1)
+        return cached
+
+    if ctx:
+        await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
+
+    query_embedding = db.embed_texts(get_voyage(), [query], input_type="query")[0]
+    rows = get_conn().execute(
+        """
+        SELECT source, chunk_index, content, embedding <=> %s AS distance
+        FROM doc_chunks
+        WHERE collection = %s
+        ORDER BY embedding <=> %s
+        LIMIT %s
+        """,
+        (query_embedding, COLLECTION_NAME, query_embedding, top_k),
+    ).fetchall()
+
+    if not rows:
+        answer = "No relevant results found in the knowledge base."
+        _cache.set(query, top_k, answer)
+        return answer
+
+    total = len(rows)
+    parts = []
+    for i, (source, chunk_idx, content, distance) in enumerate(rows, start=1):
+        parts.append(
+            f"[{i}] source: {source} (chunk {chunk_idx}, relevance score {1 - distance:.3f})\n{content}"
+        )
+        if ctx:
+            await ctx.report_progress(i, total)
+            await ctx.info(f"matched chunk {i}/{total} from {source}")
+
+    answer = "\n\n---\n\n".join(parts)
+    _cache.set(query, top_k, answer)
+    return answer
+
+
+@mcp.tool()
+def list_documents() -> str:
+    """List every source document currently indexed in the knowledge base."""
+    rows = get_conn().execute(
+        "SELECT DISTINCT source FROM doc_chunks WHERE collection = %s ORDER BY source",
+        (COLLECTION_NAME,),
+    ).fetchall()
+    if not rows:
+        return "No documents indexed yet. Run ingest.py first."
+    return "\n".join(source for (source,) in rows)
+
+
+@mcp.tool()
+def cache_stats() -> str:
+    """Report query cache hit/miss counts, hit rate, and current size."""
+    s = _cache.stats()
+    return (
+        f"hits: {s['hits']}, misses: {s['misses']}, hit_rate: {s['hit_rate']}, "
+        f"size: {s['size']}/{s['max_size']}, ttl_seconds: {s['ttl_seconds']}"
+    )
+
+
+@mcp.tool()
+def clear_cache() -> str:
+    """Clear the query cache. Run this after re-running ingest.py so stale
+    cached answers from the old index aren't served."""
+    _cache.clear()
+    return "Cache cleared."
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Rejects any request that doesn't carry the configured bearer token.
+    Only mounted when running over --transport http. /health is exempt --
+    it's used by the container HEALTHCHECK, which doesn't send a token, and
+    it exposes nothing beyond DB reachability."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+        expected = f"Bearer {AUTH_TOKEN}"
+        if request.headers.get("authorization") != expected:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+async def health(request: Request) -> JSONResponse:
+    try:
+        get_conn().execute("SELECT 1")
+    except Exception as e:
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
+    return JSONResponse({"status": "ok"})
+
+
+def run_http(host: str, port: int):
+    if not AUTH_TOKEN:
+        raise SystemExit(
+            "RAG_AUTH_TOKEN is not set. Refusing to start an unauthenticated "
+            "server over --transport http -- set RAG_AUTH_TOKEN=<some-secret> "
+            "and have clients send 'Authorization: Bearer <same-secret>'."
+        )
+    app = mcp.streamable_http_app(host=host)
+    app.add_route("/health", health, methods=["GET"])
+    app.add_middleware(BearerAuthMiddleware)
+    print(f"Serving MCP over Streamable HTTP at http://{host}:{port}/mcp "
+          f"(auth required)")
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--collection", default=COLLECTION_NAME)
+    parser.add_argument("--transport", choices=["stdio", "http"],
+                         default=os.environ.get("RAG_TRANSPORT", "stdio"))
+    parser.add_argument("--host", default=os.environ.get("RAG_HOST", "127.0.0.1"),
+                         help="Bind address for --transport http. Keep this "
+                              "127.0.0.1 if a tunnel tool (ngrok/cloudflared/"
+                              "tailscale) is forwarding to it locally; use "
+                              "0.0.0.0 only for direct LAN exposure.")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("RAG_PORT", "8743")))
+    args = parser.parse_args()
+    COLLECTION_NAME = args.collection
+
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        run_http(args.host, args.port)
+
