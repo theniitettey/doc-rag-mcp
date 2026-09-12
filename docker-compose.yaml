@@ -1,5 +1,6 @@
 # Usage (see the Makefile for the `make` target these map to):
-#   1. Put your docs in ./docs (same folder this file is in).
+#   1. Put your docs in ./docs (same folder this file is in), or set
+#      RAG_DOCS_DIR in .env to point at a different folder/file on the host.
 #   2. Set POSTGRES_PASSWORD, RAG_AUTH_TOKEN, and VOYAGE_API_KEY in a .env
 #      file next to this compose file:
 #        cp .env.example .env
@@ -72,7 +73,7 @@ services:
       RAG_PORT: ${RAG_PORT:-8743}
       RAG_DATABASE_URL: postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
     volumes:
-      - ./docs:/data/docs:ro
+      - ${RAG_DOCS_DIR:-./docs}:/data/docs:ro
       # Live-mounted (read-only) so code edits take effect on `make restart`
       # alone -- no rebuild needed. Only requirements.txt/Dockerfile changes
       # still need `make redeploy` (they're baked into the image, not
@@ -101,7 +102,7 @@ services:
       RAG_COLLECTION: ${RAG_COLLECTION:-project_docs}
       RAG_DATABASE_URL: postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
     volumes:
-      - ./docs:/data/docs:ro
+      - ${RAG_DOCS_DIR:-./docs}:/data/docs:ro
       - ./src:/app/src:ro
     entrypoint: ["python", "src/ingest.py", "--docs", "/data/docs"]
 
