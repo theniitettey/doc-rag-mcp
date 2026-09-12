@@ -324,15 +324,15 @@ section 4.
 **stdio** (local, the default) — Claude Code launches the server itself:
 
 ```bash
-claude mcp add local-docs -- /full/path/to/doc-rag-mcp/.venv/bin/python /full/path/to/doc-rag-mcp/src/server.py
+claude mcp add doc-rag-mcp -- /full/path/to/doc-rag-mcp/.venv/bin/python /full/path/to/doc-rag-mcp/src/server.py
 ```
 
 Or generate `.mcp.json` automatically — `make gen-mcp-json` writes:
 
-- `local-docs`: stdio, with this machine's real venv path, `src/server.py`
+- `doc-rag-mcp`: stdio, with this machine's real venv path, `src/server.py`
   path, and current `.env` values (`RAG_DATABASE_URL`, `RAG_COLLECTION`,
   `VOYAGE_API_KEY`) filled in.
-- `local-docs-http`: only if `RAG_AUTH_TOKEN` is set (`make auth-token`) —
+- `doc-rag-mcp-http`: only if `RAG_AUTH_TOKEN` is set (`make auth-token`) —
   points at `http://localhost:<RAG_PORT>/mcp` with the real token as a
   bearer header. This is for the server exposed *locally* by `make up`/
   `make serve-http`, not a tunnel — for genuine remote access over a
@@ -351,7 +351,7 @@ need):
 ```json
 {
   "mcpServers": {
-    "local-docs": {
+    "doc-rag-mcp": {
       "command": "/full/path/to/doc-rag-mcp/.venv/bin/python",
       "args": ["/full/path/to/doc-rag-mcp/src/server.py"],
       "env": {
@@ -368,7 +368,7 @@ need):
 server rather than a `command` entry:
 
 ```bash
-claude mcp add --transport http local-docs-remote \
+claude mcp add --transport http doc-rag-mcp-remote \
   https://your-tunnel-url/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 ```
@@ -378,7 +378,7 @@ or in `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "local-docs-remote": {
+    "doc-rag-mcp-remote": {
       "type": "http",
       "url": "https://your-tunnel-url/mcp",
       "headers": {
