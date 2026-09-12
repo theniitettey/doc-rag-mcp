@@ -4,7 +4,9 @@ src/server.py
 Exposes the Postgres/pgvector-backed knowledge base as MCP tools:
   - query_docs(query, top_k)  -> relevant chunks + sources
   - list_documents()          -> every source file currently indexed
+  - reindex_docs(force_rebuild) -> re-run ingestion without leaving the chat
   - cache_stats()             -> hit/miss counters and current cache size
+  - usage_stats()             -> Voyage token usage + cache stats, combined
   - clear_cache()             -> drop the query cache (run after re-ingesting)
 
 Transports:
@@ -41,9 +43,11 @@ Examples:
 """
 
 import argparse
+import asyncio
 import os
 import time
 from collections import OrderedDict
+from pathlib import Path
 from threading import Lock
 
 import uvicorn
@@ -53,6 +57,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import db
+import ingest
 
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "project_docs")
 
@@ -161,7 +166,7 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
     if ctx:
         await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
 
-    query_embedding = db.embed_texts(get_voyage(), [query], input_type="query")[0]
+    query_embedding = db.embed_texts(get_voyage(), [query], input_type="query", conn=get_conn())[0]
     rows = get_conn().execute(
         """
         SELECT source, chunk_index, content, embedding <=> %s AS distance
@@ -216,11 +221,89 @@ def cache_stats() -> str:
 
 
 @mcp.tool()
+def usage_stats() -> str:
+    """Report cumulative Voyage AI token usage and query cache performance
+    for this knowledge base -- a local tally of calls made through
+    ingest.py/this server, NOT your account's authoritative usage or
+    remaining free-tier balance (check https://dashboard.voyageai.com for
+    that -- this can't see usage from a shared API key used elsewhere)."""
+    rows = get_conn().execute(
+        "SELECT model, operation, total_tokens, total_requests, updated_at "
+        "FROM usage_totals ORDER BY model, operation"
+    ).fetchall()
+
+    lines = ["-- Voyage AI usage (this knowledge base only) --"]
+    if not rows:
+        lines.append("No embedding calls recorded yet.")
+    else:
+        total_tokens = sum(r[2] for r in rows)
+        total_requests = sum(r[3] for r in rows)
+        for model, operation, tokens, requests, updated_at in rows:
+            lines.append(f"{model} ({operation}): {tokens:,} tokens across {requests:,} "
+                         f"request(s), last used {updated_at}")
+        lines.append(f"Total: {total_tokens:,} tokens across {total_requests:,} request(s).")
+
+    s = _cache.stats()
+    lines.append("")
+    lines.append("-- Query cache --")
+    lines.append(f"hits: {s['hits']}, misses: {s['misses']}, hit_rate: {s['hit_rate']}, "
+                 f"size: {s['size']}/{s['max_size']}, ttl_seconds: {s['ttl_seconds']}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def clear_cache() -> str:
     """Clear the query cache. Run this after re-running ingest.py so stale
     cached answers from the old index aren't served."""
     _cache.clear()
     return "Cache cleared."
+
+
+_reindex_lock = asyncio.Lock()
+
+
+@mcp.tool()
+async def reindex_docs(force_rebuild: bool = False, ctx: Context = None) -> str:
+    """Re-scan RAG_DOCS_DIR and embed any new or changed files into the
+    knowledge base, without leaving the chat to run ingest.py by hand.
+
+    Incremental by default: unchanged files are skipped (no embedding API
+    cost); this can still take a while for a large or fully-changed doc set
+    (one Voyage API call per batch of chunks) -- the call blocks until
+    ingestion finishes. The query cache is cleared automatically afterward
+    so query_docs doesn't keep serving stale answers from before this run.
+
+    Args:
+        force_rebuild: Ignore stored file hashes and re-embed every file,
+            even ones that haven't changed. Also happens automatically if
+            the embedding model or chunk settings changed since the last run.
+    """
+    if _reindex_lock.locked():
+        return "A reindex is already running -- wait for it to finish before starting another."
+
+    docs_path = Path(os.environ.get("RAG_DOCS_DIR", "./docs")).resolve()
+    lines = []
+    error = None
+
+    async with _reindex_lock:
+        if ctx:
+            await ctx.info(f"reindexing {docs_path} (collection={COLLECTION_NAME}, "
+                            f"force_rebuild={force_rebuild})")
+        try:
+            # Runs in a worker thread so the rest of the server (health
+            # checks, other tool calls) stays responsive while this --
+            # potentially multi-minute -- ingestion runs.
+            await asyncio.to_thread(ingest.build_index, docs_path, COLLECTION_NAME, force_rebuild, lines.append)
+        except (SystemExit, Exception) as e:
+            error = str(e)
+        finally:
+            _cache.clear()
+
+    if error:
+        return f"Reindex failed: {error}\n" + "\n".join(lines)
+    lines.append("Query cache cleared automatically.")
+    return "\n".join(lines)
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
