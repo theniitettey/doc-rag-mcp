@@ -1,24 +1,6 @@
-"""
-src/db.py
-
-Shared Postgres/pgvector access for ingest.py and server.py: connection,
-schema, and the embedding call both scripts need identically.
-
-All chunks live in one `doc_chunks` table, namespaced by `collection` so
-multiple doc sets can share the same database. The embedding dimension is
-fixed per database (RAG_EMBED_DIM) -- switching to a model with a different
-output dimension requires wiping and recreating the table.
-
-Embedding provider is pluggable via RAG_EMBED_PROVIDER:
-  voyage        (default) Voyage AI's own API.
-  azure-openai  Azure OpenAI embeddings deployment.
-  openai        Vanilla OpenAI, or any OpenAI-compatible endpoint
-                (Ollama, vLLM, ...) via OPENAI_BASE_URL.
-Reranking (RAG_RERANK_MODEL) always uses Voyage's rerank API regardless of
-the embedding provider -- there's no equivalent on Azure/OpenAI, and the two
-are otherwise unrelated (you can embed via Azure and still rerank via
-Voyage's free tier, or skip reranking entirely).
-"""
+"""Shared Postgres/pgvector connection, schema, and embedding calls used by
+ingest.py and server.py. Embedding provider is pluggable (RAG_EMBED_PROVIDER)
+and reranking is Voyage-only regardless of provider -- see README."""
 
 import os
 
