@@ -1,24 +1,8 @@
-"""
-src/ingest.py
+"""Chunks and embeds docs (.pdf, .md, .txt, or a single file) into
+Postgres/pgvector. Incremental by default -- unchanged files are skipped by
+content hash. See README for --rebuild, env vars, and details.
 
-Walks a folder of docs (.pdf, .md, .txt) -- or indexes a single file
-directly if --docs points at one -- chunks the text, embeds it via the
-Voyage AI embeddings API, and stores it in Postgres (pgvector).
-
-Requires VOYAGE_API_KEY and RAG_DATABASE_URL (see .env.example).
-
-Usage:
     python src/ingest.py --docs ./docs --collection project_docs
-    python src/ingest.py --docs ./docs/one-file.pdf --collection project_docs
-
-Re-run this any time your docs change. Ingestion is incremental: each file's
-content hash is stored alongside its chunks, so unchanged files are skipped
-(no re-chunking, no embedding API calls) and only new/changed files are
-re-embedded; files removed from --docs have their chunks removed too. Pass
---rebuild (or set RAG_FORCE_REBUILD=1) to force a full re-embed of
-everything, which also happens automatically if the embedding model or
-chunk size/overlap changed since the last run (old embeddings aren't
-comparable to new ones).
 """
 
 import argparse
