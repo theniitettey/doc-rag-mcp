@@ -6,7 +6,7 @@ Exposes the Postgres/pgvector-backed knowledge base as MCP tools:
   - list_documents()          -> every source file currently indexed
   - reindex_docs(force_rebuild) -> re-run ingestion without leaving the chat
   - cache_stats()             -> hit/miss counters and current cache size
-  - usage_stats()             -> Voyage token usage + cache stats, combined
+  - usage_stats()             -> embed/rerank API token usage + cache stats
   - clear_cache()             -> drop the query cache (run after re-ingesting)
 
 Transports:
@@ -288,11 +288,15 @@ def cache_stats() -> str:
 
 @mcp.tool()
 def usage_stats() -> str:
-    """Report cumulative Voyage AI token usage and query cache performance
-    for this knowledge base -- a local tally of calls made through
-    ingest.py/this server, NOT your account's authoritative usage or
-    remaining free-tier balance (check https://dashboard.voyageai.com for
-    that -- this can't see usage from a shared API key used elsewhere)."""
+    """Report cumulative embedding/rerank API token usage and query cache
+    performance for this knowledge base -- a local tally of calls made
+    through ingest.py/this server, NOT any provider's authoritative usage
+    or remaining balance (this can't see usage from a shared API key used
+    elsewhere). Check your embedding provider's own dashboard for that:
+    Voyage https://dashboard.voyageai.com, Azure the Azure portal's cost
+    management, OpenAI https://platform.openai.com/usage. Reranking (if
+    RAG_RERANK_MODEL is set) always uses Voyage regardless of embedding
+    provider -- see https://dashboard.voyageai.com for that usage too."""
     try:
         rows = run_query(lambda conn: conn.execute(
             "SELECT model, operation, total_tokens, total_requests, updated_at "
@@ -301,7 +305,7 @@ def usage_stats() -> str:
     except Exception as e:
         return f"Failed to read usage stats: {e}"
 
-    lines = ["-- Voyage AI usage (this knowledge base only) --"]
+    lines = [f"-- API usage (embed provider: {db.EMBED_PROVIDER}; this knowledge base only) --"]
     if not rows:
         lines.append("No embedding calls recorded yet.")
     else:
