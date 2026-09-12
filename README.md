@@ -65,17 +65,22 @@ anything on disk looks new/changed/removed since. Seeing that signal is
 enough for the agent to call `reindex_docs()` on its own:
 
 ```mermaid
-flowchart TD
-    A[MCP client] -- list_documents --> B[MCP server]
-    B --> C[stat() every file:<br/>mtime + size only]
-    C --> D{new/changed/removed<br/>vs last index?}
-    D -- no --> E["'index matches docs'"]
-    D -- yes --> F["'! N new, M changed,<br/>K removed -- reindex_docs()'"]
-    E --> A
-    F --> A
-    A -- sees staleness signal,<br/>calls reindex_docs on its own --> G[MCP server]
-    G --> H[content-hash diff<br/>+ embed changed files]
-    H --> I[(Postgres + pgvector)]
+sequenceDiagram
+    actor Agent
+    participant Server as MCP server
+    participant FS as Docs folder
+    participant DB as Postgres
+
+    Agent->>Server: list_documents()
+    Server->>FS: stat() every file (mtime + size)
+    Server->>DB: last indexed mtime/size per source
+    Server-->>Agent: file list + "! N new, M changed, K removed -- reindex_docs()"
+    Note over Agent: notices the staleness signal,<br/>no user prompt needed
+    Agent->>Server: reindex_docs()
+    Server->>FS: re-read changed/new files
+    Server->>Server: content-hash diff
+    Server->>DB: embed + upsert changed files,<br/>delete chunks for removed files
+    Server-->>Agent: "X new, Y changed, Z removed"
 ```
 
 The `stat()` check is a fast heuristic, not the authoritative one — a
