@@ -2,7 +2,9 @@
 src/server.py
 
 Exposes the Postgres/pgvector-backed knowledge base as MCP tools:
-  - query_docs(query, top_k)  -> relevant chunks + sources
+  - query_docs(query, top_k)  -> relevant chunks + sources (rerank >
+                                 hybrid search > plain vector search,
+                                 whichever's configured -- see below)
   - list_documents()          -> every source file currently indexed
   - reindex_docs(force_rebuild) -> re-run ingestion without leaving the chat
   - cache_stats()             -> hit/miss counters and current cache size
@@ -46,6 +48,7 @@ import argparse
 import asyncio
 import hmac
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -62,11 +65,13 @@ import db
 import ingest
 
 MAX_TOP_K = 50
-# When reranking (db.RERANK_MODEL set), fetch this many candidates by vector
-# search per requested result, capped at RERANK_MAX_CANDIDATES -- gives the
-# reranker a real pool to choose from without an unbounded/expensive fetch.
-RERANK_CANDIDATE_MULTIPLIER = 4
-RERANK_MAX_CANDIDATES = 100
+# When reranking or hybrid-searching, fetch this many candidates by vector
+# (and, for hybrid, full-text) search per requested result, capped at
+# MAX_CANDIDATES -- gives the reranker/fusion step a real pool to choose
+# from without an unbounded/expensive fetch.
+CANDIDATE_MULTIPLIER = 4
+MAX_CANDIDATES = 100
+RRF_K = 60  # standard constant for reciprocal rank fusion
 
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "project_docs")
 
@@ -182,6 +187,69 @@ class QueryCache:
 _cache = QueryCache(CACHE_MAX_SIZE, CACHE_TTL_SECONDS)
 
 
+def fetch_vector_candidates(query_embedding, limit: int) -> list:
+    """[(id, source, chunk_index, content, distance), ...] ordered by
+    ascending cosine distance (closest first)."""
+    return run_query(lambda conn: conn.execute(
+        """
+        SELECT id, source, chunk_index, content, embedding <=> %s AS distance
+        FROM doc_chunks
+        WHERE collection = %s
+        ORDER BY embedding <=> %s
+        LIMIT %s
+        """,
+        (query_embedding, COLLECTION_NAME, query_embedding, limit),
+    ).fetchall())
+
+
+def build_or_tsquery(query: str):
+    """Turns a natural-language query into an OR-combined tsquery input
+    ('foo | bar | baz') so full-text search matches chunks containing ANY
+    query term, ranked by how many/how well they match -- the AND-only
+    default of plainto_tsquery/websearch_to_tsquery often matches nothing
+    for a multi-word natural-language question. Returns None if the query
+    has no usable words at all (pure punctuation, etc.)."""
+    words = re.findall(r"\w+", query)
+    return " | ".join(words) if words else None
+
+
+def fetch_fulltext_candidates(query: str, limit: int) -> list:
+    """[(id, source, chunk_index, content, rank), ...] ordered by
+    descending ts_rank (best match first). [] if the query has no usable
+    search terms, rather than erroring."""
+    tsquery_param = build_or_tsquery(query)
+    if not tsquery_param:
+        return []
+    return run_query(lambda conn: conn.execute(
+        """
+        SELECT id, source, chunk_index, content,
+               ts_rank(content_tsv, to_tsquery('english', %s)) AS rank
+        FROM doc_chunks
+        WHERE collection = %s AND content_tsv @@ to_tsquery('english', %s)
+        ORDER BY rank DESC
+        LIMIT %s
+        """,
+        (tsquery_param, COLLECTION_NAME, tsquery_param, limit),
+    ).fetchall())
+
+
+def reciprocal_rank_fusion(*ranked_lists, k: int = RRF_K) -> list:
+    """Each ranked_list: [(id, row), ...] already ordered best-first (rank
+    is positional, not carried in the row). Fuses any number of such lists
+    by summing 1/(k + rank) per list an id appears in -- an id missing
+    from a list simply doesn't get that list's contribution, so this
+    degrades gracefully to single-list ranking if one list is empty.
+    Returns [(id, row, fused_score), ...] sorted best-first."""
+    scores: dict = {}
+    row_by_id: dict = {}
+    for ranked_list in ranked_lists:
+        for rank, (item_id, row) in enumerate(ranked_list, start=1):
+            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (k + rank)
+            row_by_id.setdefault(item_id, row)
+    return [(item_id, row_by_id[item_id], score)
+            for item_id, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)]
+
+
 @mcp.tool()
 async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
     """Search the project's architecture docs and PDFs for relevant passages.
@@ -209,33 +277,44 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
     try:
         query_embedding = db.embed_texts(get_embed_client(), [query], input_type="query", conn=get_conn())[0]
 
-        # When reranking, over-fetch a larger candidate pool by cheap vector
-        # search, then let the (more accurate, more expensive) reranker pick
-        # the real top_k from those -- rather than ask pgvector for exactly
-        # top_k up front, which would deny the reranker anything to work with.
-        fetch_k = min(top_k * RERANK_CANDIDATE_MULTIPLIER, RERANK_MAX_CANDIDATES) if db.RERANK_MODEL else top_k
+        # Three tiers, in priority order -- rerank wins if both it and
+        # hybrid search are configured. Normalize to (source, chunk_idx,
+        # content, score) with score always "higher is better", regardless
+        # of which tier produced it.
+        if db.RERANK_MODEL:
+            # Over-fetch a larger candidate pool by cheap vector search,
+            # then let the (more accurate, more expensive) reranker pick
+            # the real top_k from those -- asking pgvector for exactly
+            # top_k up front would deny the reranker anything to work with.
+            fetch_k = min(top_k * CANDIDATE_MULTIPLIER, MAX_CANDIDATES)
+            candidates = fetch_vector_candidates(query_embedding, fetch_k)
+            if candidates:
+                documents = [c[3] for c in candidates]
+                ranked = db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=get_conn())
+                rows = [(candidates[idx][1], candidates[idx][2], candidates[idx][3], score)
+                        for idx, score in ranked]
+            else:
+                rows = []
 
-        candidates = run_query(lambda conn: conn.execute(
-            """
-            SELECT source, chunk_index, content, embedding <=> %s AS distance
-            FROM doc_chunks
-            WHERE collection = %s
-            ORDER BY embedding <=> %s
-            LIMIT %s
-            """,
-            (query_embedding, COLLECTION_NAME, query_embedding, fetch_k),
-        ).fetchall())
+        elif db.HYBRID_SEARCH:
+            # Free, provider-agnostic alternative: fuse vector search with
+            # Postgres full-text search via reciprocal rank fusion. Each
+            # side over-fetches the same way reranking does, so fusion has
+            # a real pool -- one side coming back empty (e.g. the query has
+            # no full-text-matchable terms) just degrades to the other.
+            fetch_k = min(top_k * CANDIDATE_MULTIPLIER, MAX_CANDIDATES)
+            vector_rows = fetch_vector_candidates(query_embedding, fetch_k)
+            text_rows = fetch_fulltext_candidates(query, fetch_k)
+            fused = reciprocal_rank_fusion(
+                [(r[0], r) for r in vector_rows],
+                [(r[0], r) for r in text_rows],
+            )[:top_k]
+            rows = [(row[1], row[2], row[3], score) for _id, row, score in fused]
 
-        # Normalize to (source, chunk_idx, content, score) with score always
-        # "higher is better", regardless of which path produced it.
-        if db.RERANK_MODEL and candidates:
-            documents = [c[2] for c in candidates]
-            ranked = db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=get_conn())
-            rows = [(candidates[idx][0], candidates[idx][1], candidates[idx][2], score)
-                    for idx, score in ranked]
         else:
+            candidates = fetch_vector_candidates(query_embedding, top_k)
             rows = [(source, chunk_idx, content, 1 - distance)
-                    for source, chunk_idx, content, distance in candidates[:top_k]]
+                    for _id, source, chunk_idx, content, distance in candidates]
     except Exception as e:
         if ctx:
             await ctx.info(f"query failed: {e}")
