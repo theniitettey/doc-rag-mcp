@@ -173,10 +173,14 @@ Once connected, it exposes six tools:
   bulk deletion, and the response explains what was left untouched if it
   trips.
 - `cache_stats()` — hit/miss counts, hit rate, and current cache size
-- `usage_stats()` — cumulative Voyage AI token usage (by model/operation)
-  plus cache stats, combined. This is a local tally of calls made through
-  this server/`ingest.py`, not your Voyage account's authoritative usage —
-  check the [dashboard](https://dashboard.voyageai.com) for that.
+- `usage_stats()` — cumulative embedding/rerank API token usage (by
+  model/operation, whichever `RAG_EMBED_PROVIDER` is active) plus cache
+  stats, combined. This is a local tally of calls made through this
+  server/`ingest.py`, not any provider's authoritative usage — check
+  [Voyage's dashboard](https://dashboard.voyageai.com), the Azure portal,
+  or [OpenAI's usage page](https://platform.openai.com/usage) for that,
+  depending on your provider. Reranking always shows up under Voyage
+  regardless of embed provider (see Reranking below).
 - `clear_cache()` — drop the query cache (run after re-running `src/ingest.py`
   directly; `reindex_docs` does this for you)
 
