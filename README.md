@@ -18,7 +18,7 @@ your documents and queries never go anywhere except to the embedding API.
 embeds anything new or changed, and skips the rest:
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[docs folder] --> B[chunk text]
     B --> C{content hash<br/>changed?}
     C -- no --> D[skip, no API call]
@@ -30,7 +30,7 @@ flowchart LR
 finds the closest chunks by cosine similarity:
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[Claude Code] -- query_docs --> B[MCP server]
     B --> C{cached?}
     C -- yes --> G[return cached answer]
