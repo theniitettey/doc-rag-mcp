@@ -21,6 +21,9 @@ DATABASE_URL = os.environ.get("RAG_DATABASE_URL", "postgresql://raguser:ragpass@
 EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "voyage-4-large")
 EMBED_DIM = int(os.environ.get("RAG_EMBED_DIM", "1024"))
 VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY")
+# Empty (default) = reranking disabled. Opt-in via RAG_RERANK_MODEL since it
+# costs its own tokens on top of the embedding call, on every query.
+RERANK_MODEL = os.environ.get("RAG_RERANK_MODEL", "")
 
 
 def get_connection():
@@ -107,3 +110,16 @@ def embed_texts(client: voyageai.Client, texts: list, input_type: str, conn=None
     if conn is not None:
         record_usage(conn, EMBED_MODEL, input_type, result.total_tokens)
     return [Vector(e) for e in result.embeddings]
+
+
+def rerank_texts(client: voyageai.Client, query: str, documents: list, top_k: int, conn=None) -> list:
+    """Re-scores `documents` against `query` with Voyage's rerank API --
+    more accurate than embedding-cosine-similarity alone, since it scores
+    the actual query/document pair rather than comparing two independently
+    computed vectors. Only call this when RERANK_MODEL is set.
+
+    Returns (original_index, relevance_score) pairs, best match first."""
+    result = client.rerank(query, documents, model=RERANK_MODEL, top_k=top_k)
+    if conn is not None:
+        record_usage(conn, RERANK_MODEL, "rerank", result.total_tokens)
+    return [(r.index, r.relevance_score) for r in result.results]
