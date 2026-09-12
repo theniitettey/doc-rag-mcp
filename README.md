@@ -10,10 +10,16 @@ window. There's a [dedicated section](#claude-code) below for Claude Code
 specifics, since that's what this was built and tested against, but nothing
 about the server itself is Claude-specific.
 
-Embeddings run via the Voyage AI API (requires a `VOYAGE_API_KEY`, no
-multi-GB local model download); storage is Postgres with the `pgvector`
-extension. Runs entirely on your own machine (or wherever you deploy it) —
-your documents and queries never go anywhere except to the embedding API.
+Embeddings run via a pluggable API provider — Voyage, Azure OpenAI, or
+OpenAI/OpenAI-compatible (see "Choosing an embedding provider" below) — no
+multi-GB local model download either way. Storage is Postgres with the
+`pgvector` extension. Runs entirely on your own machine (or wherever you
+deploy it) — your documents and queries only ever leave the machine for
+that one embedding call, to whichever provider you configured, plus one
+more optional case: if you turn on reranking (`RAG_RERANK_MODEL`), chunk
+text also goes to Voyage's rerank API specifically, *regardless* of which
+provider embeds your documents — see the cross-provider note under
+Reranking if you picked a non-Voyage provider for data-residency reasons.
 
 ## How it works
 
@@ -75,7 +81,10 @@ ones (see the rebuild notes in the Notes/next-steps section).
 Reranking (`RAG_RERANK_MODEL`, see below) always uses Voyage's rerank API
 regardless of this choice — there's no Azure/OpenAI equivalent, and the two
 settings are otherwise independent (embed via Azure, still rerank via
-Voyage's free tier, if you want).
+Voyage's free tier, if you want). If you didn't pick `voyage` above,
+turning on reranking requires an extra explicit opt-in
+(`RAG_ALLOW_CROSS_PROVIDER_RERANK=true`) precisely because it sends chunk
+text to Voyage regardless — see the cross-provider note under Reranking.
 
 ## 1. Install
 
@@ -233,6 +242,15 @@ both — reranking wins:
    `usage_stats()` (it tracks rerank calls as their own `operation`) to see
    the actual cost for your usage pattern before deciding whether to leave
    it on.
+
+   **Cross-provider note:** if `RAG_EMBED_PROVIDER` isn't `voyage`,
+   `query_docs` *refuses* to rerank until you also set
+   `RAG_ALLOW_CROSS_PROVIDER_RERANK=true`. This is deliberate — reranking
+   sends chunk text to Voyage no matter which provider embeds your
+   documents, which would otherwise be a silent, easy-to-miss surprise for
+   anyone who picked Azure/OpenAI specifically for data-residency reasons.
+   No such ack is needed when `RAG_EMBED_PROVIDER=voyage`, since that's the
+   same provider for both, not a second one appearing.
 2. **Hybrid search** (`RAG_HYBRID_SEARCH=true`) — free and provider-agnostic:
    fuses vector search with Postgres full-text search (`tsvector`/`ts_rank`)
    via [reciprocal rank fusion](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion),
