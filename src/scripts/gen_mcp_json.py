@@ -1,21 +1,7 @@
-"""
-src/scripts/gen_mcp_json.py
-
-Writes (or updates) .mcp.json using this machine's actual venv/server paths
-and the real values currently in .env, instead of the placeholders in
-.mcp.json.example. Run via `make gen-mcp-json` (which loads .env first).
-
-Writes two entries:
-  doc-rag-mcp      stdio, via the local venv -- the usual Claude Code setup.
-  doc-rag-mcp-http http, at http://localhost:<RAG_PORT>/mcp with the real
-                   RAG_AUTH_TOKEN as a bearer header -- only when
-                   RAG_AUTH_TOKEN is set, since that's what `make up`/
-                   `make serve-http` actually expose locally (this is NOT a
-                   tunnel URL; for genuine remote access over a tunnel, see
-                   the README and set that entry up by hand).
-
-Any other servers already in .mcp.json are left as-is.
-"""
+"""Writes .mcp.json with this machine's real venv/server paths and current
+.env values, instead of the placeholders in .mcp.json.example. Run via
+`make gen-mcp-json`. Merges in -- other existing entries are left as-is.
+See README for what it writes and why."""
 
 import json
 import os
