@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Secrets / machine-specific config -- copy from the committed .example files
+.env
+.mcp.json
+.claude/
+
+# Local Docs
+docs/
+
+# Rest client files
+*.Rest
+*.rest
+*.REST
