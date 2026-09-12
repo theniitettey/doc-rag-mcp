@@ -83,9 +83,14 @@ sequenceDiagram
     Server->>Server: content-hash diff
     Server->>DB: embed + upsert changed files,<br/>delete chunks for removed files
     Server-->>Agent: "X new, Y changed, Z removed"
+    Server->>Server: clear query cache<br/>(now stale)
     Agent->>Server: query_docs(question)
-    Server->>DB: vector (+ rerank/hybrid) search
-    Server-->>Agent: top-k relevant chunks
+    alt cached
+        Server-->>Agent: cached answer, no API call
+    else not cached
+        Server->>DB: vector (+ rerank/hybrid) search
+        Server-->>Agent: top-k relevant chunks
+    end
     Agent-->>User: answer, grounded in fresh docs
 ```
 
