@@ -39,6 +39,13 @@ RERANK_MODEL = os.environ.get("RAG_RERANK_MODEL", "")
 # search with Postgres full-text search (no API calls at all). Only takes
 # effect when RERANK_MODEL is unset -- rerank wins if both are configured.
 HYBRID_SEARCH = os.environ.get("RAG_HYBRID_SEARCH", "").lower() in ("1", "true", "yes")
+# Reranking always calls Voyage regardless of EMBED_PROVIDER (no Azure/OpenAI
+# equivalent exists) -- if you picked azure-openai/openai specifically for
+# data-residency reasons, RAG_RERANK_MODEL would otherwise silently send
+# chunk text to Voyage anyway. Require this explicit ack in that case; no
+# extra step needed when EMBED_PROVIDER=voyage, since that's not a
+# cross-provider egress at all.
+ALLOW_CROSS_PROVIDER_RERANK = os.environ.get("RAG_ALLOW_CROSS_PROVIDER_RERANK", "").lower() in ("1", "true", "yes")
 
 # Azure OpenAI (RAG_EMBED_PROVIDER=azure-openai)
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -129,11 +136,31 @@ def record_usage(conn, model: str, operation: str, tokens: int):
 
 
 def get_voyage_client() -> voyageai.Client:
-    """Always Voyage, regardless of RAG_EMBED_PROVIDER -- used directly for
-    reranking, and internally when RAG_EMBED_PROVIDER=voyage."""
+    """Always Voyage, regardless of RAG_EMBED_PROVIDER -- used internally
+    when RAG_EMBED_PROVIDER=voyage, and by get_rerank_client() below. Not
+    the right entry point for reranking specifically -- use
+    get_rerank_client() so the cross-provider check below actually runs."""
     if not VOYAGE_API_KEY:
         raise SystemExit("VOYAGE_API_KEY is not set. Get one at https://dash.voyageai.com and set it in your .env.")
     return voyageai.Client(api_key=VOYAGE_API_KEY)
+
+
+def get_rerank_client() -> voyageai.Client:
+    """Client for reranking -- always Voyage, since there's no Azure/OpenAI
+    equivalent. If RAG_EMBED_PROVIDER isn't voyage, that means chunk text
+    would go to Voyage even though you picked a different provider --
+    possibly for data-residency reasons. Refuse by default rather than do
+    that silently; RAG_ALLOW_CROSS_PROVIDER_RERANK=true opts in explicitly."""
+    if EMBED_PROVIDER != "voyage" and not ALLOW_CROSS_PROVIDER_RERANK:
+        raise ValueError(
+            f"RAG_RERANK_MODEL is set but RAG_EMBED_PROVIDER={EMBED_PROVIDER!r} -- reranking "
+            "always uses Voyage's API regardless of embed provider, so chunk text would be "
+            "sent to Voyage even though you chose a different one (possibly for data-residency "
+            "reasons). Set RAG_ALLOW_CROSS_PROVIDER_RERANK=true in .env to confirm that's fine, "
+            "or unset RAG_RERANK_MODEL (RAG_HYBRID_SEARCH is a free, provider-agnostic "
+            "alternative that never leaves Postgres)."
+        )
+    return get_voyage_client()
 
 
 def get_embed_client():
