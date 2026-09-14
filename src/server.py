@@ -44,29 +44,25 @@ AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")  # required for --transport http (
 
 mcp = MCPServer("doc-rag-mcp")
 
-_conn = None
 _embed_client = None
 _rerank_client = None
 
 
-def get_conn():
-    global _conn
-    if _conn is None or _conn.closed:
-        _conn = db.get_connection()
-    return _conn
-
-
 def run_query(fn):
-    """Call fn(conn) -> result. If the cached connection turns out to be
-    dead (Postgres restarted, a network blip) this reconnects once and
-    retries -- without it, a single dropped connection would break every
-    tool call until the process itself restarts."""
-    global _conn
+    """Check out a pooled connection, call fn(conn) -> result, return it to
+    the pool. Each call gets its own connection -- required now that server
+    calls can run concurrently (--transport http, multiple clients) and a
+    single shared connection can't safely serve two in-flight queries at
+    once. If the checked-out connection turns out to be dead (Postgres
+    restarted, a network blip), the pool discards it and this retries once
+    with a fresh one -- without it, a single dropped connection would break
+    every tool call until the process itself restarts."""
     try:
-        return fn(get_conn())
+        with db.get_pool().connection() as conn:
+            return fn(conn)
     except psycopg.OperationalError:
-        _conn = None
-        return fn(get_conn())
+        with db.get_pool().connection() as conn:
+            return fn(conn)
 
 
 def get_embed_client():
@@ -239,7 +235,9 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
         await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
 
     try:
-        query_embedding = db.embed_texts(get_embed_client(), [query], input_type="query", conn=get_conn())[0]
+        query_embedding = run_query(
+            lambda conn: db.embed_texts(get_embed_client(), [query], input_type="query", conn=conn)
+        )[0]
 
         # Three tiers, in priority order -- rerank wins if both it and
         # hybrid search are configured. Normalize to (source, chunk_idx,
@@ -254,7 +252,9 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
             candidates = fetch_vector_candidates(query_embedding, fetch_k)
             if candidates:
                 documents = [c[3] for c in candidates]
-                ranked = db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=get_conn())
+                ranked = run_query(
+                    lambda conn: db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=conn)
+                )
                 rows = [(candidates[idx][1], candidates[idx][2], candidates[idx][3], score)
                         for idx, score in ranked]
             else:

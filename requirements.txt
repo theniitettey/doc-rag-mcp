@@ -1,5 +1,6 @@
 mcp>=2.0.0
 psycopg[binary]>=3.1
+psycopg[pool]>=3.1
 pgvector>=0.3.0
 voyageai>=0.3.0
 openai>=1.0.0

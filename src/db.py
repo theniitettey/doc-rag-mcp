@@ -8,6 +8,7 @@ import psycopg
 import voyageai
 from pgvector import Vector
 from pgvector.psycopg import register_vector
+from psycopg_pool import ConnectionPool
 
 DATABASE_URL = os.environ.get("RAG_DATABASE_URL", "postgresql://raguser:ragpass@localhost:5432/ragdb")
 # Both matter for the same failure mode: a connection or an embedding API
@@ -17,6 +18,13 @@ DATABASE_URL = os.environ.get("RAG_DATABASE_URL", "postgresql://raguser:ragpass@
 # and lets the caller retry.
 DB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("RAG_DB_CONNECT_TIMEOUT", "10"))
 DB_STATEMENT_TIMEOUT_MS = int(os.environ.get("RAG_DB_STATEMENT_TIMEOUT_MS", "30000"))
+# Pool sizing for server.py, which serves concurrent tool calls (especially
+# under --transport http) and must never hand two callers the same physical
+# connection at once. ingest.py/query_cli.py are single-threaded, one-shot
+# CLI runs and use get_connection() directly instead -- a pool would be pure
+# overhead there.
+DB_POOL_MIN_SIZE = int(os.environ.get("RAG_DB_POOL_MIN_SIZE", "1"))
+DB_POOL_MAX_SIZE = int(os.environ.get("RAG_DB_POOL_MAX_SIZE", "10"))
 EMBED_TIMEOUT_SECONDS = float(os.environ.get("RAG_EMBED_TIMEOUT_SECONDS", "30"))
 EMBED_PROVIDER = os.environ.get("RAG_EMBED_PROVIDER", "voyage").lower()
 EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "voyage-4-large")
@@ -48,26 +56,54 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")  # unset = api.openai.com
 
 
-def get_connection():
-    conn = psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
-        # TCP keepalives so a connection that died silently (container
-        # restart, network blip) gets noticed -- raised as OperationalError,
-        # which run_query() already catches and reconnects on -- instead of
-        # a query just sitting there waiting for a response that will never
-        # come.
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=3,
-        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
-    )
+# Shared by get_connection() and the pool (get_pool()) so both a one-shot
+# CLI connection and every pooled connection get the same timeouts/keepalive
+# behavior.
+CONNECT_KWARGS = dict(
+    autocommit=True,
+    connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+    # TCP keepalives so a connection that died silently (container restart,
+    # network blip) gets noticed -- raised as OperationalError, which
+    # run_query()/the pool already handle -- instead of a query just sitting
+    # there waiting for a response that will never come.
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=3,
+    options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
+)
+
+
+def _configure_connection(conn):
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     register_vector(conn)
     ensure_schema(conn)
+
+
+def get_connection():
+    conn = psycopg.connect(DATABASE_URL, **CONNECT_KWARGS)
+    _configure_connection(conn)
     return conn
+
+
+_pool = None
+
+
+def get_pool() -> ConnectionPool:
+    """Connection pool for server.py, which handles concurrent tool calls
+    (multiple clients over --transport http) and must not let two callers
+    share one physical connection. Created lazily so importing db.py never
+    opens a connection on its own."""
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=DB_POOL_MIN_SIZE,
+            max_size=DB_POOL_MAX_SIZE,
+            kwargs=CONNECT_KWARGS,
+            configure=_configure_connection,
+        )
+    return _pool
 
 
 def ensure_schema(conn):
