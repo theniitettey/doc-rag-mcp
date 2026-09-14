@@ -1,4 +1,4 @@
-.PHONY: install auth-token gen-mcp-json ingest ingest-rebuild serve serve-http clean \
+.PHONY: install auth-token gen-mcp-json ingest ingest-rebuild serve serve-http query clean \
         build up down restart redeploy db db-down db-reset reindex reindex-rebuild logs clear-cache
 
 VENV        := .venv
@@ -71,6 +71,13 @@ serve: install
 ## (run `make auth-token` first).
 serve-http: install
 	@$(LOAD_ENV) $(PYTHON) src/server.py --transport http
+
+## Query the knowledge base straight from the terminal, no MCP client
+## needed. Drops into an interactive prompt by default; pass QUERY="..."
+## for a single one-off question (optionally TOP_K=N, default 5). Requires
+## Postgres reachable and the index already built (see `make db`, `make ingest`).
+query: install
+	@$(LOAD_ENV) $(PYTHON) src/scripts/query_cli.py $(if $(QUERY),"$(QUERY)") $(if $(TOP_K),--top-k $(TOP_K))
 
 clean:
 	rm -rf $(VENV) __pycache__
