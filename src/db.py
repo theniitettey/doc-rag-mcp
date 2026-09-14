@@ -10,6 +10,14 @@ from pgvector import Vector
 from pgvector.psycopg import register_vector
 
 DATABASE_URL = os.environ.get("RAG_DATABASE_URL", "postgresql://raguser:ragpass@localhost:5432/ragdb")
+# Both matter for the same failure mode: a connection or an embedding API
+# call that goes quietly dead mid-request (network blip, Postgres/Voyage
+# restart) with no timeout hangs forever from the caller's side -- a tool
+# call that never errors and never returns, rather than one that fails fast
+# and lets the caller retry.
+DB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("RAG_DB_CONNECT_TIMEOUT", "10"))
+DB_STATEMENT_TIMEOUT_MS = int(os.environ.get("RAG_DB_STATEMENT_TIMEOUT_MS", "30000"))
+EMBED_TIMEOUT_SECONDS = float(os.environ.get("RAG_EMBED_TIMEOUT_SECONDS", "30"))
 EMBED_PROVIDER = os.environ.get("RAG_EMBED_PROVIDER", "voyage").lower()
 EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "voyage-4-large")
 EMBED_DIM = int(os.environ.get("RAG_EMBED_DIM", "1024"))
@@ -41,7 +49,21 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")  # unset = api.openai.com
 
 
 def get_connection():
-    conn = psycopg.connect(DATABASE_URL, autocommit=True)
+    conn = psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+        # TCP keepalives so a connection that died silently (container
+        # restart, network blip) gets noticed -- raised as OperationalError,
+        # which run_query() already catches and reconnects on -- instead of
+        # a query just sitting there waiting for a response that will never
+        # come.
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
+    )
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     register_vector(conn)
     ensure_schema(conn)
@@ -102,6 +124,14 @@ def ensure_schema(conn):
     conn.execute("""
         ALTER TABLE collection_config ADD COLUMN IF NOT EXISTS last_indexed_at TIMESTAMPTZ
     """)
+    # Set when a reindex refuses a large removal (see build_index's
+    # removal_threshold guard) and cleared the next time a reindex completes
+    # without tripping it -- so the refusal stays visible in list_documents
+    # across calls instead of only appearing once, in that one reindex_docs
+    # response, which is easy to miss.
+    conn.execute("""
+        ALTER TABLE collection_config ADD COLUMN IF NOT EXISTS pending_removal_sources TEXT[]
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS usage_totals (
             model TEXT NOT NULL,
@@ -139,7 +169,10 @@ def get_voyage_client() -> voyageai.Client:
     get_rerank_client() so the cross-provider check below actually runs."""
     if not VOYAGE_API_KEY:
         raise SystemExit("VOYAGE_API_KEY is not set. Get one at https://dash.voyageai.com and set it in your .env.")
-    return voyageai.Client(api_key=VOYAGE_API_KEY)
+    # voyageai.Client defaults to timeout=None (no timeout at all) -- a
+    # stalled request would otherwise hang the calling tool forever instead
+    # of failing fast.
+    return voyageai.Client(api_key=VOYAGE_API_KEY, timeout=EMBED_TIMEOUT_SECONDS)
 
 
 def get_rerank_client() -> voyageai.Client:
@@ -179,13 +212,14 @@ def get_embed_client():
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             api_key=AZURE_OPENAI_API_KEY,
             api_version=AZURE_OPENAI_API_VERSION,
+            timeout=EMBED_TIMEOUT_SECONDS,
         )
 
     if EMBED_PROVIDER == "openai":
         if not OPENAI_API_KEY:
             raise SystemExit("RAG_EMBED_PROVIDER=openai requires OPENAI_API_KEY to be set.")
         import openai
-        return openai.OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        return openai.OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=EMBED_TIMEOUT_SECONDS)
 
     raise SystemExit(
         f"Unknown RAG_EMBED_PROVIDER '{EMBED_PROVIDER}' -- expected 'voyage', 'azure-openai', or 'openai'."
