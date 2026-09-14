@@ -205,14 +205,16 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
     )
 
     existing_hashes = {}
-    for source, file_hash_value in conn.execute(
-        "SELECT DISTINCT ON (source) source, file_hash FROM doc_chunks WHERE collection = %s",
+    existing_sizes = {}
+    for source, file_hash_value, size_value in conn.execute(
+        "SELECT DISTINCT ON (source) source, file_hash, file_size FROM doc_chunks WHERE collection = %s",
         (collection,),
     ).fetchall():
         existing_hashes[source] = file_hash_value
+        existing_sizes[source] = size_value
 
     current_sources = set()
-    added_count, updated_count, skipped_count, failed_count = 0, 0, 0, 0
+    added_count, updated_count, skipped_count, failed_count, guarded_count = 0, 0, 0, 0, 0
 
     for path in files:
         rel_path = str(path.relative_to(base_dir))
@@ -239,6 +241,29 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
             continue
 
         is_update = rel_path in existing_hashes
+
+        if is_update:
+            old_size = existing_sizes.get(rel_path)
+            # A file that still exists but has drastically shrunk is much more
+            # often corruption or an accidental overwrite (a doc truncated to
+            # near-empty, a botched save) than an intentional rewrite -- its
+            # content hash changed just like a normal edit would, so without
+            # this check it would be silently re-embedded and overwrite the
+            # old (good) chunks with near-nothing. Mirrors the mass-removal
+            # guard above: refuse to act on it silently, and leave the
+            # existing indexed chunks for this file untouched rather than
+            # blocking the rest of the run. old_size can be NULL for rows
+            # that predate file_size being tracked -- skip the check then,
+            # same as elsewhere in this function.
+            if old_size is not None and old_size > 200 and size < old_size * 0.1:
+                log(f"  ! {rel_path} shrank from {old_size} to {size} bytes (under 10% of its "
+                    f"previous size) -- this usually means the file was corrupted or accidentally "
+                    f"overwritten rather than intentionally rewritten. Leaving its existing indexed "
+                    f"chunks untouched this run rather than replacing them with near-empty content. "
+                    f"Re-run with --rebuild (CLI) or force_rebuild=True (reindex_docs) once you've "
+                    f"confirmed the new content is correct.")
+                guarded_count += 1
+                continue
 
         # Byte-identical content under a different filename (this run or a
         # previous one) -- reuse its embeddings instead of re-calling the
@@ -323,6 +348,7 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
 
     log(f"Done. {added_count} new file(s), {updated_count} changed file(s), "
           f"{skipped_count} unchanged (skipped), {len(removed_sources)} removed"
+          + (f", {guarded_count} guarded (drastic shrink, not overwritten)" if guarded_count else "")
           + (f", {failed_count} failed" if failed_count else "") + ".")
     log(f"Collection '{collection}' now has {total_chunks} chunks stored in Postgres.")
 

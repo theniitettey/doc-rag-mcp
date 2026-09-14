@@ -25,7 +25,12 @@ def main():
     parser = argparse.ArgumentParser(description="Query the doc-rag-mcp knowledge base from the terminal.")
     parser.add_argument("query", nargs="?", default="", help="One-off question. Omit for an interactive prompt.")
     parser.add_argument("--top-k", type=int, default=5, help="Number of chunks to return (default 5).")
+    parser.add_argument("--collection", default=server.COLLECTION_NAME,
+                         help="Named collection to query (default from RAG_COLLECTION env var, "
+                              f"currently '{server.COLLECTION_NAME}').")
     args = parser.parse_args()
+
+    server.COLLECTION_NAME = args.collection
 
     if args.query.strip():
         asyncio.run(ask(args.query, args.top_k))

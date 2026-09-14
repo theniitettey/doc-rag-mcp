@@ -1,6 +1,7 @@
 """MCP server over the Postgres/pgvector knowledge base: query_docs,
-list_documents, reindex_docs, cache_stats, usage_stats, clear_cache. See
-README for transports, auth, caching, and reranking/hybrid search.
+list_documents, reindex_docs, remove_document, cache_stats, usage_stats,
+clear_cache. See README for transports, auth, caching, and reranking/hybrid
+search.
 
     python src/server.py                   # stdio (default)
     python src/server.py --transport http  # network-reachable
@@ -44,29 +45,25 @@ AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")  # required for --transport http (
 
 mcp = MCPServer("doc-rag-mcp")
 
-_conn = None
 _embed_client = None
 _rerank_client = None
 
 
-def get_conn():
-    global _conn
-    if _conn is None or _conn.closed:
-        _conn = db.get_connection()
-    return _conn
-
-
 def run_query(fn):
-    """Call fn(conn) -> result. If the cached connection turns out to be
-    dead (Postgres restarted, a network blip) this reconnects once and
-    retries -- without it, a single dropped connection would break every
-    tool call until the process itself restarts."""
-    global _conn
+    """Check out a pooled connection, call fn(conn) -> result, return it to
+    the pool. Each call gets its own connection -- required now that server
+    calls can run concurrently (--transport http, multiple clients) and a
+    single shared connection can't safely serve two in-flight queries at
+    once. If the checked-out connection turns out to be dead (Postgres
+    restarted, a network blip), the pool discards it and this retries once
+    with a fresh one -- without it, a single dropped connection would break
+    every tool call until the process itself restarts."""
     try:
-        return fn(get_conn())
+        with db.get_pool().connection() as conn:
+            return fn(conn)
     except psycopg.OperationalError:
-        _conn = None
-        return fn(get_conn())
+        with db.get_pool().connection() as conn:
+            return fn(conn)
 
 
 def get_embed_client():
@@ -102,7 +99,13 @@ class QueryCache:
 
     @staticmethod
     def make_key(query: str, top_k: int) -> tuple:
-        return (query.strip().lower(), top_k)
+        # Include which ranking mode produced the answer -- rerank/hybrid/
+        # plain vector search are fixed at process startup from env vars
+        # today, so this is currently redundant within a single process,
+        # but keying on it avoids a stale-mode answer being served if that
+        # ever stops being true.
+        mode = "rerank" if db.RERANK_MODEL else ("hybrid" if db.HYBRID_SEARCH else "vector")
+        return (query.strip().lower(), top_k, mode)
 
     def get(self, query: str, top_k: int):
         key = self.make_key(query, top_k)
@@ -239,7 +242,9 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
         await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
 
     try:
-        query_embedding = db.embed_texts(get_embed_client(), [query], input_type="query", conn=get_conn())[0]
+        query_embedding = run_query(
+            lambda conn: db.embed_texts(get_embed_client(), [query], input_type="query", conn=conn)
+        )[0]
 
         # Three tiers, in priority order -- rerank wins if both it and
         # hybrid search are configured. Normalize to (source, chunk_idx,
@@ -254,7 +259,9 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
             candidates = fetch_vector_candidates(query_embedding, fetch_k)
             if candidates:
                 documents = [c[3] for c in candidates]
-                ranked = db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=get_conn())
+                ranked = run_query(
+                    lambda conn: db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=conn)
+                )
                 rows = [(candidates[idx][1], candidates[idx][2], candidates[idx][3], score)
                         for idx, score in ranked]
             else:
@@ -474,6 +481,62 @@ def clear_cache() -> str:
     cached answers from the old index aren't served."""
     _cache.clear()
     return "Cache cleared."
+
+
+@mcp.tool()
+def remove_document(source: str) -> str:
+    """Remove a single document from the index on demand, without a full
+    reindex_docs() run -- useful when a file is gone/renamed and you don't
+    want to wait for (or trigger) a full reconciliation pass.
+
+    Deletes every chunk for `source` in the current collection. Also clears
+    it from the collection's pending-removal list (see list_documents())
+    if it was flagged there, so it stops being surfaced as a refused mass
+    removal.
+
+    Args:
+        source: The document path exactly as shown by list_documents()
+            (relative to RAG_DOCS_DIR), e.g. "guides/setup.md".
+    """
+    if not source or not source.strip():
+        return "source must not be empty."
+    source = source.strip()
+
+    def do_remove(conn):
+        with conn.transaction():
+            deleted = conn.execute(
+                "DELETE FROM doc_chunks WHERE collection = %s AND source = %s",
+                (COLLECTION_NAME, source),
+            ).rowcount
+
+            row = conn.execute(
+                "SELECT pending_removal_sources FROM collection_config WHERE collection = %s",
+                (COLLECTION_NAME,),
+            ).fetchone()
+            pending = row[0] if row and row[0] else []
+            was_pending = source in pending
+            if was_pending:
+                remaining = [s for s in pending if s != source] or None
+                conn.execute(
+                    "UPDATE collection_config SET pending_removal_sources = %s WHERE collection = %s",
+                    (remaining, COLLECTION_NAME),
+                )
+        return deleted, was_pending
+
+    try:
+        deleted, was_pending = run_query(do_remove)
+    except Exception as e:
+        return f"Failed to remove document: {e}"
+
+    if deleted == 0 and not was_pending:
+        return f"No such document indexed: {source!r}"
+
+    _cache.clear()
+
+    parts = [f"Removed {deleted} chunk(s) for {source!r}."]
+    if was_pending:
+        parts.append("Also cleared it from the pending-removal list.")
+    return " ".join(parts)
 
 
 _reindex_lock = asyncio.Lock()
