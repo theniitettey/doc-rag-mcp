@@ -382,15 +382,25 @@ def list_documents() -> str:
 
     try:
         meta = run_query(lambda conn: conn.execute(
-            "SELECT last_indexed_at FROM collection_config WHERE collection = %s",
+            "SELECT last_indexed_at, pending_removal_sources FROM collection_config WHERE collection = %s",
             (COLLECTION_NAME,),
         ).fetchone())
     except Exception:
         meta = None
     last_indexed_at = meta[0] if meta else None
+    pending_removals = meta[1] if meta and meta[1] else None
 
     lines = [f"{len(sources)} document(s) indexed"
              + (f", last reindexed {last_indexed_at}" if last_indexed_at else "") + "."]
+
+    if pending_removals:
+        lines.append(
+            f"! {len(pending_removals)} previously-indexed file(s) no longer exist under the docs "
+            f"path but were NOT removed -- the last reindex refused because that looked like a "
+            f"misconfigured RAG_DOCS_DIR rather than intentional deletion: {', '.join(pending_removals)}. "
+            "This stays flagged until RAG_DOCS_DIR is fixed and reindexed, or until you call "
+            "reindex_docs(confirm_large_removal=True) to confirm the deletion is intentional."
+        )
 
     freshness = check_index_freshness()
     if freshness is None:
