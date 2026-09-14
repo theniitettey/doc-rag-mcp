@@ -301,10 +301,21 @@ def build_index(docs_path: Path, collection: str, force_rebuild: bool = False, l
             f"rather than genuine deletions. Re-run with --confirm-removal (CLI) or "
             f"confirm_large_removal=True (reindex_docs) if this is intentional. Not removed: "
             f"{', '.join(sorted(removed_sources))}")
+        # Persisted (not just logged here) so list_documents keeps surfacing
+        # this until it's actually resolved, instead of the warning only
+        # existing in this one reindex call's output.
+        conn.execute(
+            "UPDATE collection_config SET pending_removal_sources = %s WHERE collection = %s",
+            (sorted(removed_sources), collection),
+        )
         removed_sources = set()
     else:
         for rel_path in removed_sources:
             conn.execute("DELETE FROM doc_chunks WHERE collection = %s AND source = %s", (collection, rel_path))
+        conn.execute(
+            "UPDATE collection_config SET pending_removal_sources = NULL WHERE collection = %s",
+            (collection,),
+        )
 
     total_chunks = conn.execute(
         "SELECT count(*) FROM doc_chunks WHERE collection = %s", (collection,)
