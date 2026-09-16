@@ -21,7 +21,7 @@ def main():
     if not VENV_PYTHON.exists():
         sys.exit(f"{VENV_PYTHON} not found -- run `make install` first.")
 
-    for var in ("RAG_DATABASE_URL", "VOYAGE_API_KEY"):
+    for var in ("RAG_DATABASE_URL", "RAG_DOCS_DIR", "VOYAGE_API_KEY"):
         if not os.environ.get(var):
             print(f"warning: {var} is not set in .env -- the generated entry will have it empty.",
                   file=sys.stderr)
@@ -32,6 +32,11 @@ def main():
         "env": {
             "RAG_DATABASE_URL": os.environ.get("RAG_DATABASE_URL", ""),
             "RAG_COLLECTION": os.environ.get("RAG_COLLECTION", "project_docs"),
+            # Without this, list_documents()'s staleness check falls back to
+            # ./docs relative to wherever the MCP client happens to spawn
+            # this process from -- usually missing, which used to crash the
+            # whole server (see _compute_index_freshness() in server.py).
+            "RAG_DOCS_DIR": os.environ.get("RAG_DOCS_DIR", ""),
             "VOYAGE_API_KEY": os.environ.get("VOYAGE_API_KEY", ""),
         },
     }
