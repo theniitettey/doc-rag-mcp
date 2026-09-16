@@ -12,6 +12,7 @@ import asyncio
 import hmac
 import os
 import re
+import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -36,10 +37,27 @@ CANDIDATE_MULTIPLIER = 4
 MAX_CANDIDATES = 100
 RRF_K = 60  # standard constant for reciprocal rank fusion
 
-COLLECTION_NAME = os.environ.get("RAG_COLLECTION", "project_docs")
+_RAG_COLLECTION_ENV = os.environ.get("RAG_COLLECTION")
+COLLECTION_NAME = _RAG_COLLECTION_ENV or "project_docs"
+if not _RAG_COLLECTION_ENV:
+    # Falling back silently is how docs from unrelated projects end up
+    # sharing one collection on a shared Postgres instance -- print loudly
+    # (stderr, since stdio transport reserves stdout for JSON-RPC) so a
+    # misconfigured deploy is obvious instead of surfacing later as
+    # confusing cross-project "pending removal" noise in list_documents().
+    print(f"WARNING: RAG_COLLECTION is not set -- falling back to the shared default "
+          f"collection {COLLECTION_NAME!r}. If this Postgres instance is shared by multiple "
+          f"docs sources, set RAG_COLLECTION explicitly in .env.", file=sys.stderr)
 
 CACHE_MAX_SIZE = int(os.environ.get("RAG_CACHE_MAX_SIZE", "256"))
 CACHE_TTL_SECONDS = int(os.environ.get("RAG_CACHE_TTL_SECONDS", "600"))  # 10 min default
+
+# check_index_freshness() walks every file under RAG_DOCS_DIR and scans every
+# chunk row in the collection -- too expensive to redo on every list_documents()
+# call (an agent calling it repeatedly in one session is the common case this
+# guards against). Cached for this many seconds; reindex_docs()/remove_document()
+# invalidate it immediately so freshness never lies right after a real change.
+FRESHNESS_CACHE_TTL_SECONDS = int(os.environ.get("RAG_FRESHNESS_CACHE_TTL_SECONDS", "30"))
 
 AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")  # required for --transport http (see below)
 
@@ -98,17 +116,21 @@ class QueryCache:
         self.misses = 0
 
     @staticmethod
-    def make_key(query: str, top_k: int) -> tuple:
+    def make_key(query: str, top_k: int, collection) -> tuple:
         # Include which ranking mode produced the answer -- rerank/hybrid/
         # plain vector search are fixed at process startup from env vars
         # today, so this is currently redundant within a single process,
         # but keying on it avoids a stale-mode answer being served if that
         # ever stops being true.
         mode = "rerank" if db.RERANK_MODEL else ("hybrid" if db.HYBRID_SEARCH else "vector")
-        return (query.strip().lower(), top_k, mode)
+        # A 2-element scope tuple, not a plain string -- so a real
+        # collection someday literally named "all"/"ALL" can never collide
+        # with the all_collections=True merged-search cache entry.
+        scope = ("all",) if collection is None else ("one", collection)
+        return (query.strip().lower(), top_k, mode, scope)
 
-    def get(self, query: str, top_k: int):
-        key = self.make_key(query, top_k)
+    def get(self, query: str, top_k: int, collection):
+        key = self.make_key(query, top_k, collection)
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -123,8 +145,8 @@ class QueryCache:
             self.hits += 1
             return value
 
-    def set(self, query: str, top_k: int, value: str):
-        key = self.make_key(query, top_k)
+    def set(self, query: str, top_k: int, collection, value: str):
+        key = self.make_key(query, top_k, collection)
         with self._lock:
             self._store[key] = (time.time(), value)
             self._store.move_to_end(key)
@@ -154,18 +176,26 @@ class QueryCache:
 _cache = QueryCache(CACHE_MAX_SIZE, CACHE_TTL_SECONDS)
 
 
-def fetch_vector_candidates(query_embedding, limit: int) -> list:
-    """[(id, source, chunk_index, content, distance), ...] ordered by
-    ascending cosine distance (closest first)."""
+def fetch_vector_candidates(query_embedding, limit: int, collection) -> list:
+    """[(id, collection, source, chunk_index, content, distance), ...]
+    ordered by ascending cosine distance (closest first). collection=None
+    searches every collection in the shared database (no WHERE filter) --
+    callers must have already confirmed that's actually safe (see the
+    embed-model guard in query_docs) before passing None."""
+    where = "WHERE collection = %s" if collection is not None else ""
+    params = [query_embedding]
+    if collection is not None:
+        params.append(collection)
+    params += [query_embedding, limit]
     return run_query(lambda conn: conn.execute(
-        """
-        SELECT id, source, chunk_index, content, embedding <=> %s AS distance
+        f"""
+        SELECT id, collection, source, chunk_index, content, embedding <=> %s AS distance
         FROM doc_chunks
-        WHERE collection = %s
+        {where}
         ORDER BY embedding <=> %s
         LIMIT %s
         """,
-        (query_embedding, COLLECTION_NAME, query_embedding, limit),
+        params,
     ).fetchall())
 
 
@@ -180,23 +210,32 @@ def build_or_tsquery(query: str):
     return " | ".join(words) if words else None
 
 
-def fetch_fulltext_candidates(query: str, limit: int) -> list:
-    """[(id, source, chunk_index, content, rank), ...] ordered by
-    descending ts_rank (best match first). [] if the query has no usable
-    search terms, rather than erroring."""
+def fetch_fulltext_candidates(query: str, limit: int, collection) -> list:
+    """[(id, collection, source, chunk_index, content, rank), ...] ordered
+    by descending ts_rank (best match first). [] if the query has no usable
+    search terms, rather than erroring. collection=None searches every
+    collection (see fetch_vector_candidates)."""
     tsquery_param = build_or_tsquery(query)
     if not tsquery_param:
         return []
+    collection_clause = " AND collection = %s" if collection is not None else ""
+    # Param order must follow the %s occurrences left-to-right in the SQL
+    # below: ts_rank's to_tsquery, then the WHERE to_tsquery, then (if
+    # present) collection, then LIMIT.
+    params = [tsquery_param, tsquery_param]
+    if collection is not None:
+        params.append(collection)
+    params.append(limit)
     return run_query(lambda conn: conn.execute(
-        """
-        SELECT id, source, chunk_index, content,
+        f"""
+        SELECT id, collection, source, chunk_index, content,
                ts_rank(content_tsv, to_tsquery('english', %s)) AS rank
         FROM doc_chunks
-        WHERE collection = %s AND content_tsv @@ to_tsquery('english', %s)
+        WHERE content_tsv @@ to_tsquery('english', %s){collection_clause}
         ORDER BY rank DESC
         LIMIT %s
         """,
-        (tsquery_param, COLLECTION_NAME, tsquery_param, limit),
+        params,
     ).fetchall())
 
 
@@ -217,21 +256,46 @@ def reciprocal_rank_fusion(*ranked_lists, k: int = RRF_K) -> list:
             for item_id, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)]
 
 
+def fetch_embed_models_by_collection() -> dict:
+    """{collection: embed_model}, limited to collections that currently have
+    indexed chunks (excludes a collection_config row left behind by a
+    force_rebuild that wiped doc_chunks but hasn't been re-ingested yet --
+    that's not a real search candidate). One query, not N+1."""
+    rows = run_query(lambda conn: conn.execute(
+        "SELECT cc.collection, cc.embed_model FROM collection_config cc "
+        "WHERE EXISTS (SELECT 1 FROM doc_chunks dc WHERE dc.collection = cc.collection)"
+    ).fetchall())
+    return dict(rows)
+
+
 @mcp.tool()
-async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
+async def query_docs(query: str, top_k: int = 5, collection: str = None,
+                      all_collections: bool = False, ctx: Context = None) -> str:
     """Search the project's architecture docs and PDFs for relevant passages.
 
     Args:
         query: Natural-language question or search phrase.
         top_k: Number of chunks to return (default 5, max 50).
+        collection: Search this named collection instead of the server's
+            default (RAG_COLLECTION). Mutually exclusive with all_collections.
+            See list_collections() for what's available.
+        all_collections: Search across every collection in the shared
+            database instead of just one -- an explicit opt-in for when you
+            deliberately want the whole knowledge base, not the default
+            (isolated to one collection). Refused if the collections being
+            merged were indexed with different embedding models, since their
+            vectors aren't comparable.
     """
     if not query or not query.strip():
         return "query must not be empty."
     if top_k <= 0:
         return "top_k must be a positive integer."
     top_k = min(top_k, MAX_TOP_K)
+    if collection is not None and all_collections:
+        return "collection and all_collections=True are mutually exclusive -- pass one or the other."
+    effective_collection = None if all_collections else (collection or COLLECTION_NAME)
 
-    cached = _cache.get(query, top_k)
+    cached = _cache.get(query, top_k, effective_collection)
     if cached is not None:
         if ctx:
             await ctx.info(f"cache hit for query '{query}' (top_k={top_k})")
@@ -241,28 +305,43 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
     if ctx:
         await ctx.info(f"cache miss for query '{query}' (top_k={top_k}) -- querying index")
 
+    if all_collections:
+        embed_models = fetch_embed_models_by_collection()
+        distinct_models = set(embed_models.values())
+        if len(distinct_models) > 1:
+            by_model = {}
+            for coll, model in embed_models.items():
+                by_model.setdefault(model, []).append(coll)
+            detail = "; ".join(f"{m}: {', '.join(sorted(cs))}" for m, cs in sorted(by_model.items()))
+            answer = ("Cannot search across all collections: they were indexed with different "
+                      f"embedding models, so vector similarity isn't comparable. {detail}. "
+                      "Query a specific collection with collection=<name> instead.")
+            _cache.set(query, top_k, effective_collection, answer)
+            return answer
+
     try:
         query_embedding = run_query(
             lambda conn: db.embed_texts(get_embed_client(), [query], input_type="query", conn=conn)
         )[0]
 
         # Three tiers, in priority order -- rerank wins if both it and
-        # hybrid search are configured. Normalize to (source, chunk_idx,
-        # content, score) with score always "higher is better", regardless
-        # of which tier produced it.
+        # hybrid search are configured. Normalize to (collection, source,
+        # chunk_idx, content, score) with score always "higher is better",
+        # regardless of which tier produced it.
         if db.RERANK_MODEL:
             # Over-fetch a larger candidate pool by cheap vector search,
             # then let the (more accurate, more expensive) reranker pick
             # the real top_k from those -- asking pgvector for exactly
             # top_k up front would deny the reranker anything to work with.
             fetch_k = min(top_k * CANDIDATE_MULTIPLIER, MAX_CANDIDATES)
-            candidates = fetch_vector_candidates(query_embedding, fetch_k)
+            candidates = fetch_vector_candidates(query_embedding, fetch_k, effective_collection)
             if candidates:
-                documents = [c[3] for c in candidates]
+                documents = [c[4] for c in candidates]
                 ranked = run_query(
                     lambda conn: db.rerank_texts(get_rerank_client(), query, documents, top_k, conn=conn)
                 )
-                rows = [(candidates[idx][1], candidates[idx][2], candidates[idx][3], score)
+                rows = [(candidates[idx][1], candidates[idx][2], candidates[idx][3],
+                         candidates[idx][4], score)
                         for idx, score in ranked]
             else:
                 rows = []
@@ -274,18 +353,18 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
             # a real pool -- one side coming back empty (e.g. the query has
             # no full-text-matchable terms) just degrades to the other.
             fetch_k = min(top_k * CANDIDATE_MULTIPLIER, MAX_CANDIDATES)
-            vector_rows = fetch_vector_candidates(query_embedding, fetch_k)
-            text_rows = fetch_fulltext_candidates(query, fetch_k)
+            vector_rows = fetch_vector_candidates(query_embedding, fetch_k, effective_collection)
+            text_rows = fetch_fulltext_candidates(query, fetch_k, effective_collection)
             fused = reciprocal_rank_fusion(
                 [(r[0], r) for r in vector_rows],
                 [(r[0], r) for r in text_rows],
             )[:top_k]
-            rows = [(row[1], row[2], row[3], score) for _id, row, score in fused]
+            rows = [(row[1], row[2], row[3], row[4], score) for _id, row, score in fused]
 
         else:
-            candidates = fetch_vector_candidates(query_embedding, top_k)
-            rows = [(source, chunk_idx, content, 1 - distance)
-                    for _id, source, chunk_idx, content, distance in candidates]
+            candidates = fetch_vector_candidates(query_embedding, top_k, effective_collection)
+            rows = [(coll, source, chunk_idx, content, 1 - distance)
+                    for _id, coll, source, chunk_idx, content, distance in candidates]
     except (SystemExit, Exception) as e:
         # SystemExit included deliberately: get_embed_client()/
         # get_rerank_client() raise it for missing provider config, and
@@ -297,25 +376,56 @@ async def query_docs(query: str, top_k: int = 5, ctx: Context = None) -> str:
 
     if not rows:
         answer = "No relevant results found in the knowledge base."
-        _cache.set(query, top_k, answer)
+        _cache.set(query, top_k, effective_collection, answer)
         return answer
 
     total = len(rows)
     parts = []
-    for i, (source, chunk_idx, content, score) in enumerate(rows, start=1):
+    for i, (coll, source, chunk_idx, content, score) in enumerate(rows, start=1):
+        label = f"{coll}/{source}" if all_collections else source
         parts.append(
-            f"[{i}] source: {source} (chunk {chunk_idx}, relevance score {score:.3f})\n{content}"
+            f"[{i}] source: {label} (chunk {chunk_idx}, relevance score {score:.3f})\n{content}"
         )
         if ctx:
             await ctx.report_progress(i, total)
-            await ctx.info(f"matched chunk {i}/{total} from {source}")
+            await ctx.info(f"matched chunk {i}/{total} from {label}")
 
     answer = "\n\n---\n\n".join(parts)
-    _cache.set(query, top_k, answer)
+    _cache.set(query, top_k, effective_collection, answer)
     return answer
 
 
+_freshness_lock = Lock()
+_freshness_cache = {"result": None, "checked_at": 0.0}
+
+
+def invalidate_freshness_cache():
+    """Called after reindex_docs()/remove_document() so the next
+    list_documents() recomputes freshness instead of serving a cached
+    answer from before the change."""
+    with _freshness_lock:
+        _freshness_cache["checked_at"] = 0.0
+
+
 def check_index_freshness():
+    """Cached wrapper around _compute_index_freshness() -- see that
+    function for what this actually checks. Recomputing it on every
+    list_documents() call means walking every file under RAG_DOCS_DIR and
+    scanning every chunk row in the collection each time, which gets slow
+    fast when a client calls list_documents() repeatedly (e.g. an agent
+    checking it once per turn). Cached for FRESHNESS_CACHE_TTL_SECONDS;
+    invalidate_freshness_cache() clears it early after a real change."""
+    with _freshness_lock:
+        if time.time() - _freshness_cache["checked_at"] <= FRESHNESS_CACHE_TTL_SECONDS:
+            return _freshness_cache["result"]
+    result = _compute_index_freshness()
+    with _freshness_lock:
+        _freshness_cache["result"] = result
+        _freshness_cache["checked_at"] = time.time()
+    return result
+
+
+def _compute_index_freshness():
     """Cheap, read-only comparison between what's on disk (RAG_DOCS_DIR) and
     what's actually indexed -- stat() only (mtime + size), no file content
     reads at all, so this stays fast regardless of how large the doc set or
@@ -371,58 +481,131 @@ def check_index_freshness():
 
 
 @mcp.tool()
-def list_documents() -> str:
+def list_documents(collection: str = None, all_collections: bool = False) -> str:
     """List every source document currently indexed, when the collection
     was last reindexed, and whether the docs folder has changed since
     (new/changed/removed files) -- so a client can notice staleness and
-    call reindex_docs() on its own, without the user having to say so."""
+    call reindex_docs() on its own, without the user having to say so.
+
+    Args:
+        collection: List this named collection instead of the server's
+            default (RAG_COLLECTION). Mutually exclusive with all_collections.
+        all_collections: List documents across every collection in the
+            shared database, labeled "collection/source". Staleness
+            checking and the pending-removal notice are per-collection and
+            are skipped in this mode -- see list_collections() for that
+            detail broken out by collection.
+    """
+    if collection is not None and all_collections:
+        return "collection and all_collections=True are mutually exclusive -- pass one or the other."
+    effective_collection = None if all_collections else (collection or COLLECTION_NAME)
+
     try:
-        rows = run_query(lambda conn: conn.execute(
-            "SELECT DISTINCT source FROM doc_chunks WHERE collection = %s ORDER BY source",
-            (COLLECTION_NAME,),
-        ).fetchall())
+        if all_collections:
+            rows = run_query(lambda conn: conn.execute(
+                "SELECT DISTINCT collection, source FROM doc_chunks ORDER BY collection, source",
+            ).fetchall())
+        else:
+            rows = run_query(lambda conn: conn.execute(
+                "SELECT DISTINCT source FROM doc_chunks WHERE collection = %s ORDER BY source",
+                (effective_collection,),
+            ).fetchall())
     except Exception as e:
         return f"Failed to list documents: {e}"
     if not rows:
         return "No documents indexed yet. Run ingest.py first."
-    sources = [source for (source,) in rows]
 
-    try:
-        meta = run_query(lambda conn: conn.execute(
-            "SELECT last_indexed_at, pending_removal_sources FROM collection_config WHERE collection = %s",
-            (COLLECTION_NAME,),
-        ).fetchone())
-    except Exception:
-        meta = None
-    last_indexed_at = meta[0] if meta else None
-    pending_removals = meta[1] if meta and meta[1] else None
-
-    lines = [f"{len(sources)} document(s) indexed"
-             + (f", last reindexed {last_indexed_at}" if last_indexed_at else "") + "."]
-
-    if pending_removals:
-        lines.append(
-            f"! {len(pending_removals)} previously-indexed file(s) no longer exist under the docs "
-            f"path but were NOT removed -- the last reindex refused because that looked like a "
-            f"misconfigured RAG_DOCS_DIR rather than intentional deletion: {', '.join(pending_removals)}. "
-            "This stays flagged until RAG_DOCS_DIR is fixed and reindexed, or until you call "
-            "reindex_docs(confirm_large_removal=True) to confirm the deletion is intentional."
-        )
-
-    freshness = check_index_freshness()
-    if freshness is None:
-        lines.append("(could not check the docs folder for changes)")
-    elif freshness["new"] or freshness["changed"] or freshness["removed"]:
-        lines.append(
-            f"! Docs folder has changed since last index: {len(freshness['new'])} new, "
-            f"{len(freshness['changed'])} changed, {len(freshness['removed'])} removed. "
-            "Call reindex_docs() to update."
-        )
+    if all_collections:
+        sources = [f"{coll}/{source}" for coll, source in rows]
+        collections_seen = {coll for coll, _source in rows}
+        lines = [f"{len(sources)} document(s) indexed across {len(collections_seen)} collection(s). "
+                 "Call list_collections() for per-collection detail."]
     else:
-        lines.append("Docs folder matches the index -- no reindex needed.")
+        sources = [source for (source,) in rows]
+        try:
+            meta = run_query(lambda conn: conn.execute(
+                "SELECT last_indexed_at, pending_removal_sources FROM collection_config WHERE collection = %s",
+                (effective_collection,),
+            ).fetchone())
+        except Exception:
+            meta = None
+        last_indexed_at = meta[0] if meta else None
+        pending_removals = meta[1] if meta and meta[1] else None
+
+        lines = [f"{len(sources)} document(s) indexed"
+                 + (f", last reindexed {last_indexed_at}" if last_indexed_at else "") + "."]
+
+        if pending_removals:
+            lines.append(
+                f"! {len(pending_removals)} previously-indexed file(s) no longer exist under the docs "
+                f"path but were NOT removed -- the last reindex refused because that looked like a "
+                f"misconfigured RAG_DOCS_DIR rather than intentional deletion: {', '.join(pending_removals)}. "
+                "This stays flagged until RAG_DOCS_DIR is fixed and reindexed, or until you call "
+                "reindex_docs(confirm_large_removal=True) to confirm the deletion is intentional."
+            )
+
+        # Freshness compares RAG_DOCS_DIR on disk against one collection's
+        # rows -- only meaningful for this server's own configured
+        # collection, since that's the only docs directory this process
+        # actually knows about. Checking it against a different collection
+        # (or merged across all of them) would compare the wrong directory
+        # to the wrong rows and reproduce exactly the cross-collection
+        # contamination bug this whole feature exists to prevent.
+        if effective_collection == COLLECTION_NAME:
+            freshness = check_index_freshness()
+            if freshness is None:
+                lines.append("(could not check the docs folder for changes)")
+            elif freshness["new"] or freshness["changed"] or freshness["removed"]:
+                lines.append(
+                    f"! Docs folder has changed since last index: {len(freshness['new'])} new, "
+                    f"{len(freshness['changed'])} changed, {len(freshness['removed'])} removed. "
+                    "Call reindex_docs() to update."
+                )
+            else:
+                lines.append("Docs folder matches the index -- no reindex needed.")
+        else:
+            lines.append(
+                "(freshness check only applies to this server's own collection "
+                f"{COLLECTION_NAME!r} -- omit collection/all_collections to check it)"
+            )
 
     lines.append("")
     lines.extend(sources)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_collections() -> str:
+    """Enumerate every collection in the shared Postgres instance -- embed
+    model, chunk settings, last reindex time, document count, and any
+    pending-removal flag -- so you can see what's actually in the shared
+    database before an all_collections=True search."""
+    try:
+        rows = run_query(lambda conn: conn.execute(
+            """
+            SELECT cc.collection, cc.embed_model, cc.chunk_size, cc.chunk_overlap,
+                   cc.last_indexed_at, cc.pending_removal_sources,
+                   COUNT(DISTINCT dc.source) AS doc_count
+            FROM collection_config cc
+            LEFT JOIN doc_chunks dc ON dc.collection = cc.collection
+            GROUP BY cc.collection, cc.embed_model, cc.chunk_size, cc.chunk_overlap,
+                     cc.last_indexed_at, cc.pending_removal_sources
+            ORDER BY cc.collection
+            """
+        ).fetchall())
+    except Exception as e:
+        return f"Failed to list collections: {e}"
+    if not rows:
+        return "No collections indexed yet."
+
+    lines = [f"{len(rows)} collection(s) in the shared database:"]
+    for coll, model, chunk_size, chunk_overlap, last_indexed, pending, doc_count in rows:
+        marker = " (this server's default)" if coll == COLLECTION_NAME else ""
+        line = (f"- {coll}{marker}: {doc_count} document(s), embed_model={model}, "
+                f"chunk_size={chunk_size}, chunk_overlap={chunk_overlap}, last_indexed={last_indexed}")
+        if pending:
+            line += f", ! {len(pending)} pending removal(s)"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -484,34 +667,39 @@ def clear_cache() -> str:
 
 
 @mcp.tool()
-def remove_document(source: str) -> str:
+def remove_document(source: str, collection: str = None) -> str:
     """Remove a single document from the index on demand, without a full
     reindex_docs() run -- useful when a file is gone/renamed and you don't
     want to wait for (or trigger) a full reconciliation pass.
 
-    Deletes every chunk for `source` in the current collection. Also clears
-    it from the collection's pending-removal list (see list_documents())
+    Deletes every chunk for `source` in the target collection. Also clears
+    it from that collection's pending-removal list (see list_documents())
     if it was flagged there, so it stops being surfaced as a refused mass
-    removal.
+    removal. There's deliberately no all_collections option here -- removal
+    is scoped to exactly one collection at a time, never a blanket delete
+    across the shared database.
 
     Args:
         source: The document path exactly as shown by list_documents()
             (relative to RAG_DOCS_DIR), e.g. "guides/setup.md".
+        collection: Remove from this named collection instead of the
+            server's default (RAG_COLLECTION).
     """
     if not source or not source.strip():
         return "source must not be empty."
     source = source.strip()
+    effective_collection = collection or COLLECTION_NAME
 
     def do_remove(conn):
         with conn.transaction():
             deleted = conn.execute(
                 "DELETE FROM doc_chunks WHERE collection = %s AND source = %s",
-                (COLLECTION_NAME, source),
+                (effective_collection, source),
             ).rowcount
 
             row = conn.execute(
                 "SELECT pending_removal_sources FROM collection_config WHERE collection = %s",
-                (COLLECTION_NAME,),
+                (effective_collection,),
             ).fetchone()
             pending = row[0] if row and row[0] else []
             was_pending = source in pending
@@ -519,7 +707,7 @@ def remove_document(source: str) -> str:
                 remaining = [s for s in pending if s != source] or None
                 conn.execute(
                     "UPDATE collection_config SET pending_removal_sources = %s WHERE collection = %s",
-                    (remaining, COLLECTION_NAME),
+                    (remaining, effective_collection),
                 )
         return deleted, was_pending
 
@@ -532,6 +720,7 @@ def remove_document(source: str) -> str:
         return f"No such document indexed: {source!r}"
 
     _cache.clear()
+    invalidate_freshness_cache()
 
     parts = [f"Removed {deleted} chunk(s) for {source!r}."]
     if was_pending:
@@ -586,6 +775,7 @@ async def reindex_docs(force_rebuild: bool = False, confirm_large_removal: bool 
             error = str(e)
         finally:
             _cache.clear()
+            invalidate_freshness_cache()
 
     if error:
         return f"Reindex failed: {error}\n" + "\n".join(lines)
