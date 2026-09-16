@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import server  # noqa: E402
 
 
-async def ask(query: str, top_k: int) -> None:
-    print(await server.query_docs(query, top_k))
+async def ask(query: str, top_k: int, collection: str) -> None:
+    print(await server.query_docs(query, top_k, collection=collection))
 
 
 def main():
@@ -30,13 +30,11 @@ def main():
                               f"currently '{server.COLLECTION_NAME}').")
     args = parser.parse_args()
 
-    server.COLLECTION_NAME = args.collection
-
     if args.query.strip():
-        asyncio.run(ask(args.query, args.top_k))
+        asyncio.run(ask(args.query, args.top_k, args.collection))
         return
 
-    print(f"doc-rag-mcp -- querying collection '{server.COLLECTION_NAME}'. "
+    print(f"doc-rag-mcp -- querying collection '{args.collection}'. "
           "Empty line or Ctrl-D to quit.\n")
     while True:
         try:
@@ -46,7 +44,7 @@ def main():
             break
         if not query:
             break
-        asyncio.run(ask(query, args.top_k))
+        asyncio.run(ask(query, args.top_k, args.collection))
         print()
 
 

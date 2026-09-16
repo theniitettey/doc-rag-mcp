@@ -215,17 +215,36 @@ in section 5 for the HTTP case:
   see section 5 ("Run it on a network / behind a tunnel") for starting the
   server this way and the auth token it requires.
 
-Once connected, it exposes six tools:
+Once connected, it exposes eight tools:
 
-- `query_docs(query, top_k=5)` — semantic search over the indexed chunks,
-  returns the matching passages with their source file and a relevance
-  score. Ranks by rerank (`RAG_RERANK_MODEL`) if set, else hybrid search
-  (`RAG_HYBRID_SEARCH=true`) if enabled, else plain cosine similarity — see
-  "Improving on plain vector search" below.
-- `list_documents()` — lists every file currently indexed, when the
-  collection was last reindexed, and a fast staleness signal (new/changed/
-  removed files since then, detected via file mtime + size) — see
-  "Staying fresh" above
+- `query_docs(query, top_k=5, collection=None, all_collections=False)` —
+  semantic search over the indexed chunks, returns the matching passages
+  with their source file and a relevance score. Ranks by rerank
+  (`RAG_RERANK_MODEL`) if set, else hybrid search (`RAG_HYBRID_SEARCH=true`)
+  if enabled, else plain cosine similarity — see "Improving on plain vector
+  search" below. Scoped to the server's default collection
+  (`RAG_COLLECTION`) unless `collection=<name>` targets a different one, or
+  `all_collections=True` deliberately searches every collection in the
+  shared database at once (mutually exclusive with `collection`; refused if
+  the collections being merged were indexed with different embedding
+  models, since their vectors aren't comparable) — see "Multiple
+  collections" below.
+- `list_documents(collection=None, all_collections=False)` — lists every
+  file currently indexed, when the collection was last reindexed, and a
+  fast staleness signal (new/changed/removed files since then, detected via
+  file mtime + size) — see "Staying fresh" above. Same `collection`/
+  `all_collections` scoping as `query_docs`; the staleness signal only
+  applies to the server's own default collection (it's the only docs
+  directory this process actually knows about), so it's omitted when
+  targeting a different collection or `all_collections=True`. The staleness
+  check itself (a full walk of `RAG_DOCS_DIR` plus a scan of every indexed
+  chunk) is cached for `RAG_FRESHNESS_CACHE_TTL_SECONDS` (default 30s) so
+  repeated calls in the same session stay fast; `reindex_docs`/
+  `remove_document` invalidate it immediately so it never reports stale
+  info right after a real change.
+- `list_collections()` — enumerates every collection in the shared
+  database (embed model, chunk settings, last reindex time, document count,
+  pending-removal flag) — see "Multiple collections" below.
 - `reindex_docs(force_rebuild=False, confirm_large_removal=False)` —
   re-scan `RAG_DOCS_DIR` and embed anything new or changed, without leaving
   the chat to run `ingest.py` by hand. Incremental by default; blocks until
@@ -234,7 +253,12 @@ Once connected, it exposes six tools:
   previously-indexed files in one go unless `confirm_large_removal=True` —
   that pattern is much more often a misconfigured docs path than genuine
   bulk deletion, and the response explains what was left untouched if it
-  trips.
+  trips. Always targets this server's own configured collection.
+- `remove_document(source, collection=None)` — removes a single document
+  from the index on demand (e.g. a renamed/deleted file), without a full
+  `reindex_docs()` run. Scoped to one collection at a time — deliberately
+  no `all_collections` option, since a blanket cross-collection delete is
+  exactly the mistake collection scoping exists to prevent.
 - `cache_stats()` — hit/miss counts, hit rate, and current cache size
 - `usage_stats()` — cumulative embedding/rerank API token usage (by
   model/operation, whichever `RAG_EMBED_PROVIDER` is active) plus cache
@@ -253,7 +277,9 @@ handled" and it'll call `query_docs` on its own.
 ### Caching
 
 Query results are cached in-process (LRU, TTL-based) keyed by the normalized
-`(query, top_k)` pair. A repeated question skips both the embedding call and
+`(query, top_k, collection-scope)` triple — a scoped query and an
+`all_collections=True` query for identical text are cached separately, never
+sharing an answer. A repeated question skips both the embedding call and
 the Postgres round-trip. Tune it with env vars:
 
 ```json
@@ -262,6 +288,10 @@ the Postgres round-trip. Tune it with env vars:
   "RAG_CACHE_TTL_SECONDS": "600"
 }
 ```
+
+`list_documents()`'s staleness check has its own, separate TTL cache (it's
+not query results, so it doesn't belong to the cache above) —
+`RAG_FRESHNESS_CACHE_TTL_SECONDS` (default 30s).
 
 The cache lives in the running server process's memory, so it resets
 whenever the client restarts the server, and it will **not** know if you
@@ -450,6 +480,23 @@ for source, content in rows:
   `--collection` name at ingest time and matching `RAG_COLLECTION` per MCP
   server entry — no extra database needed. Note the embedding dimension
   (`RAG_EMBED_DIM`) is shared across all collections in one database.
+  **Give every distinct docs source its own `RAG_COLLECTION`** — leaving it
+  unset falls back to the shared `"project_docs"` name (the server warns on
+  stderr when this happens), and multiple docs sources landing in that same
+  default collection is exactly how unrelated projects end up "polluting"
+  each other's index: `list_documents()`'s staleness/pending-removal checks
+  are per-collection, so a shared collection makes one project's docs
+  changing look like corruption of another's.
+
+  `list_collections()` shows everything currently in the shared database.
+  `query_docs`/`list_documents` default to this server's own collection
+  (`RAG_COLLECTION`, isolated — nothing pours in from another collection by
+  accident) but accept `collection=<name>` to target a different one, or
+  `all_collections=True` to deliberately search across every collection at
+  once. All-collections search is refused if the collections involved were
+  indexed with different embedding models (their vectors aren't
+  comparable) — reindex them onto a consistent model first, or query one
+  collection at a time.
 
 ## Claude Code
 
