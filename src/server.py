@@ -445,7 +445,13 @@ def _compute_index_freshness():
     try:
         docs_path = Path(os.environ.get("RAG_DOCS_DIR", "./docs")).resolve()
         base_dir, files = ingest.collect_files(docs_path)
-    except Exception:
+    except (SystemExit, Exception):
+        # SystemExit included deliberately: collect_files() raises it (not a
+        # plain Exception) when docs_path doesn't exist -- e.g. RAG_DOCS_DIR
+        # unset and the default ./docs missing, a real misconfiguration this
+        # should report gracefully instead of crashing the whole server
+        # process (SystemExit isn't an Exception subclass, so a bare `except
+        # Exception` here silently let it propagate all the way up).
         return None
 
     try:
